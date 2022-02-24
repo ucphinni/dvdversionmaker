@@ -1511,8 +1511,6 @@ class OnlineConfigDbMgr:
             try:
                 if create_schema:
                     await queries.create_schema(db)
-                    await db.commit()
-                    await db.execute("BEGIN TRANSACTION")
                 await queries.delete_all_local_paths(db)
                 h = {'DLDIR': str(CfgMgr.DLDIR) + os.path.sep,
                      'MENUDIR': str(CfgMgr.MENUDIR) + os.path.sep,
@@ -1536,7 +1534,7 @@ class OnlineConfigDbMgr:
                 print("done load")
                 break
             except sqlite3.OperationalError:
-                print("except")
+                print(traceback.format_exc())
                 await db.rollback()
                 break
             else:
@@ -1898,13 +1896,17 @@ class OnlineConfigDbMgr:
 
 
 async def setup_db_conn(conn):
-    await conn.execute("PRAGMA journal_mode=WAL")
+    # await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA foreign_keys=ON")
     await conn.execute("PRAGMA read_uncommitted=ON")
     conn.row_factory = aiosqlite.Row
 
 global ocd
 ocd = None
+
+DEBUG = True
+if DEBUG:
+    print("debug mode on !!!!!!!")
 
 
 async def main_async_func():
@@ -1916,7 +1918,10 @@ async def main_async_func():
         loop.stop()
         return
     dbexists = dbfn.exists()
-    # Put your application code here
+    if DEBUG:
+        dbexists = False
+        dbfn.unlink()
+
     try:
         async with httpx.AsyncClient(
                 http2=True, follow_redirects=True) as session:

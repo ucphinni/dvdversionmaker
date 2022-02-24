@@ -1,3 +1,14 @@
+ 
+--  This SQL file is built to python module aiosql 
+--  specifications to be loaded by the calling script.
+--  (https://github.com/omnilib/aiosqlite).  The database
+--  that is created is an sqlite3 lite database.
+--  
+--  Script is assumed to have the following connections pragmas:
+--  - READ uncommited
+--  - WAL
+
+
 -- name: start_load#
 
 DROP TABLE IF EXISTS "dvdfile_incoming";
