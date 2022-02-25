@@ -709,14 +709,16 @@ CREATE VIEW spumux_xml as
 select distinct d.dvdnum, d.dvdmenu,f.tab,f.str from dvdbutton d,(
    select 0 tab,'<?xml version="1.0" ?>' str
    union all
-   select 1,'<subpictures>'
+   select 1,'<subpictures format="NTSC" >'
    union all
    select 2,'<stream>'
 ) f
 union all
 select distinct m.dvdnum, d.dvdmenu, 2 ,
-'<spu force="yes" start="00:00:00.00" image="'|| m.sifn||'" highlight="'
-||m.shfn||'" select="'||m.ssfn||'">' from dvdmenufn d
+'<spu force="yes" start="00:00:00.00" image="'|| 
+(select dir from localpath where key = 'MENUDIR')||m.sifn||'" highlight="'
+||(select dir from localpath where key = 'MENUDIR')||m.shfn||'" select="'
+||(select dir from localpath where key = 'MENUDIR')||m.ssfn||'">' from dvdmenufn d
 left join menufn m on (m.dvdnum = d.dvdnum and ifnull(d.renum_menu,0) = m.renum_menu)
 union all
 select distinct db.dvdnum,db.dvdmenu, 3 , '<button name="'||db.buttonname||'" '

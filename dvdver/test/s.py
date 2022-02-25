@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import traceback
 
@@ -15,7 +16,9 @@ from PIL import ImageFont, ImageDraw, Image
 from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
+from anyio._backends._asyncio import CancelledError
 import httpx
+from mouseinfo import size
 
 
 print("RUNNING ::$Id: s.py,v 1.28 2022/02/13 08:31:18 ucphinni Exp ucphinni $")
@@ -82,12 +85,28 @@ class CfgMgr:
         assert not(awsary is not None and aws is None)
         if awsary is not None:
             raise NotImplementedError()
-        paws = set(filter(lambda t: t is not None
-                          and not t.done(), aws))
+        paws = set(aws)
         if len(paws) == 0:
             return (aws, set())
 
-        ret = await asyncio.wait(paws, timeout=timeout)
+        ret = await asyncio.wait(
+            paws, timeout=timeout,
+            return_when=asyncio.FIRST_EXCEPTION)
+        done, _ = ret
+        for i in done:
+            exc = i.exception()
+            if exc is not None:
+                if type(exc) == AssertionError:
+                    _, _, tb = sys.exc_info()
+                    traceback.print_tb(tb)  # Fixed format
+                    tb_info = traceback.extract_tb(tb)
+                    filename, line, func, text = tb_info[-1]
+
+                    print(f'An error occurred on {filename}:{line} {func} in statement {text}'.format(
+                        line, text))
+                    exit(1)
+                print(repr(exc))
+
         return ret
 
     async def _wait_tasks_complete2(self, awsary=None, aws=None, timeout=None):
@@ -724,6 +743,10 @@ class TaskLoader:
 
     def set_afh(self, afh: AIOFile):
         self._afh = afh
+        if self._source is not None:
+            pos = self._source._pos
+            pos = pos if pos is not None else 0
+            self.add_chunk(pos, bytearray(), block=False)
 
     async def _send_chunk(self, _):
         assert False  # Must Overide
@@ -753,6 +776,7 @@ class TaskLoader:
             #       PE----->PE)
             #       WS       WE
             # State: Can use but some possible chunk trimming work
+            await self._send_chunk(chunk[PE - WS:])
             async with self._cond:
                 self._last_proc_chunk_start_pos = PE
                 self._last_proc_chunk_end_pos = WE
@@ -761,7 +785,6 @@ class TaskLoader:
                 #               WE
                 #     <---------GE   (If Gap end exists in range, clear it)
                 self._read_from_file_gap_end = None
-            await self._send_chunk(chunk[PE - WS:])
             return
 
         if PE < WS:
@@ -787,7 +810,7 @@ class TaskLoader:
             start = pos
             chunk = await reader.read_chunk()
             if not chunk:
-                break
+                return
             m = memoryview(chunk)
             m.toreadonly()
 
@@ -804,6 +827,8 @@ class TaskLoader:
         self._is_running = True
         assert self._source is not None
         try:
+            if self._source is not None:
+                self._read_from_file_gap_end = self._source._pos
             while self._is_running:
                 chunk_item = await self._queue.get()
                 if chunk_item[0] is None and chunk_item[1] is None:
@@ -823,6 +848,7 @@ class TaskLoader:
                 await self._fill_gap_from_file()
 
         except asyncio.exceptions.CancelledError:
+            print("Got Canceled")
             pass
         finally:
 
@@ -1076,6 +1102,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         self._proc = None
         self._is_running_apel = False
         self._process_terminated = False
+        self._process_terminating = False
+        self._lock = asyncio.Lock()
 
     async def handle_stream_eof(self, stream):
         pass
@@ -1084,25 +1112,57 @@ class AsyncProcExecLoader(TaskLoader, ABC):
     async def handle_stream(self, stream, buf):
         pass
 
+    async def handle_stream_err(self, stream, e):
+        print("exception", stream, e)
+        return False
+
     async def run(self):
         if self._is_running_apel:
             return
         self._is_running_apel = True
-        _ = CfgMgr.create_task(self._start_cmd())
-        await super().run()
+        cmd_task = CfgMgr.create_task(self._start_cmd())
+        print("asyncprocexecloader run start", self._taskme)
+        try:
+            await super().run()
+        except AssertionError:
+            _, _, tb = sys.exc_info()
+            traceback.print_tb(tb)  # Fixed format
+            tb_info = traceback.extract_tb(tb)
+            filename, line, func, text = tb_info[-1]
+
+            print(f'An error occurred on {filename}:{line} {func}'
+                  f' in statement {text}'.format(line, text))
+            exit(1)
+        except:
+            print(traceback.format_exc())
+            raise
+        print("awaiting cmd task", self._taskme)
+        cmd_task.cancel()
+        await cmd_task
+        print("asyncprocexecloader run done", self._taskme)
 
     async def _start_cmd(self):
         async def _read_stream(stream, obj):
             while True:
-                buf = await stream.read(obj._bufsz)
-                if buf:
-                    try:
-                        await obj.handle_stream(stream, buf)
-                    except Exception as e:
-                        obj.handle_stream_err(stream, e)
-                else:
-                    await obj.handle_stream_eof(stream)
-                    break
+                # await asyncio.sleep(0)
+                try:
+                    buf = await stream.read(obj._bufsz)
+
+                    if buf:
+                        try:
+                            await obj.handle_stream(stream, buf)
+                        except Exception as e:
+                            if not await obj.handle_stream_err(stream, e):
+                                raise e
+                    else:
+                        await obj.handle_stream_eof(stream)
+                        break
+                    if stream.at_eof():
+                        await obj.handle_stream_eof(stream)
+                        break
+                except CancelledError:
+                    continue
+        pid, rc = None, None
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *self._cmd_ary,
@@ -1111,42 +1171,84 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 stderr=asyncio.subprocess.PIPE
             )
             proc = self._proc
-            aws = set([
-                CfgMgr.create_task(_read_stream(proc.stdout, self)),
-                CfgMgr.create_task(_read_stream(proc.stderr, self)),
-            ])
-            await CfgMgr.wait_tasks_complete(aws=aws)
-            rc = await proc.wait()
-            return proc.pid, rc
+            aws = [
+                asyncio.create_task(proc.wait()),
+                asyncio.create_task(_read_stream(proc.stdout, self)),
+                asyncio.create_task(_read_stream(proc.stderr, self)),
+            ]
+            rc, _, _ = asyncio.gather(*aws)
+            pid = proc.pid
+        except CancelledError:
+            pass
         except OSError as e:
             return e
+        finally:
+            print("proc done", self._taskme)
+            while True:
+                print("In cancel loop")
+                _, aws = await asyncio.wait(aws, timeout=10)
+                for i in aws:
+                    i.cancel()
+                if len(aws) == 0:
+                    break
+            print("stream_handlers done", self._taskme)
+        return pid, rc
 
-    async def _handle_source_eos_if_self_at_end(self):
-
+    async def _handle_source_eos_if_self_at_end(self, stdin):
         if self._process_terminated:
-            return
+            return False
         size = self._source.finished_size()
-        if self._last_proc_chunk_start_pos >= size:
+        if size is None:
+            return False
+        assert self._last_proc_chunk_start_pos <= size
+        ret = False
+        if self._last_proc_chunk_start_pos == size:
             self._process_terminated = True
-        return
+            stdin.write_eof()
+            stdin.close()
+            await stdin.wait_closed()
+            ret = True
+
+        if not self._process_terminating:
+            self._process_terminating = True
+            self.add_chunk(None, None)
+            return ret
+        return ret
+
+    async def _get_stdin(self):
+        if self._process_terminated:
+            return None
+        while self._proc is None:
+            await asyncio.sleep(0)
+        return self._proc.stdin
 
     async def handle_source_eos(self):
-        await self._handle_source_eos_if_self_at_end()
-        await self._proc.stdin.drain()
+        await self._send_chunk(None)
 
     async def _send_chunk(self, chunk):
-        try:
-            assert len(chunk)
-            if self._proc is None:
-                while self._proc is None:
-                    await asyncio.sleep(0)
-            self._proc.stdin.write(chunk)
-            await self._handle_source_eos_if_self_at_end()
-            await self._proc.stdin.drain()
-
-        except ConnectionResetError:
-            print("ConnectionResetError")
+        if chunk is None:
             pass
+        elif len(chunk):
+            pass
+        else:
+            return
+        stdin = await self._get_stdin()
+        async with self._lock:
+            if stdin is None:
+                return
+            if chunk is not None:
+                stdin.write(chunk)
+            if await self._handle_source_eos_if_self_at_end(stdin):
+                return
+
+            try:
+                await stdin.drain()
+            except ConnectionResetError as e:
+                if chunk is None or self._process_terminated:
+                    pass
+                else:
+                    print("Connection Reset")
+                    raise e
 
 
 class SpuMuxWriter(AsyncProcExecLoader):
@@ -1172,8 +1274,10 @@ class SpuMuxWriter(AsyncProcExecLoader):
     async def handle_stream(self, stream, buf):
         if stream == self._proc.stdout:
             await self._afho.write(buf)
+            await self._afho.fsync()
         elif stream == self._proc.stderr:
             print(buf)
+        return
 
     async def run(self):
         try:
@@ -1181,7 +1285,7 @@ class SpuMuxWriter(AsyncProcExecLoader):
                 self._afho = f
                 await super().run()
         finally:
-            pass
+            self._afho = None
 
 
 class AsyncStreamTaskMgr:
@@ -1228,7 +1332,6 @@ class AsyncStreamTaskMgr:
         await self.wait_for_started()
         if self._afh is not None:
             obj.set_afh(self._afh)
-            obj.add_chunk(self._pos, bytearray(), block=True)
         return self
 
     async def remove_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
@@ -1365,7 +1468,6 @@ class AsyncStreamTaskMgr:
         finally:
             self._taskme = None
         for i in self._taskloaders:
-            i.run_task()
             await i.handle_source_eos()
 
         for i in self._taskloaders:
@@ -1811,10 +1913,13 @@ class OnlineConfigDbMgr:
             spumuxwriter = SpuMuxWriter(procmgr, xfn, mfn2)
             await procmgr.add_TaskLoader(spumuxwriter)
             fftasks.append(CfgMgr.create_task(procmgr.run()))
-            # spumuxwriter.run_task()
+            spumuxwriter.run_task()
 
         print("wait for spumux menu mpg")
-        await CfgMgr.wait_tasks_complete(aws=fftasks)
+        try:
+            await asyncio.gather(*fftasks)
+        except AssertionError:
+            traceback.print_exc()
         print("done spumux menu mpg")
 
         self._running_db_load = False
@@ -1884,7 +1989,6 @@ class OnlineConfigDbMgr:
             await self.run_load(create_schema=not dbexists, block=True)
         tt = None
         async with aiosqlite.connect(self._dbfn) as db:
-            self._db = db
             await setup_db_conn(db)
             if dbexists:
                 await self.run_load(create_schema=False, block=False)
@@ -1892,7 +1996,6 @@ class OnlineConfigDbMgr:
             if tt is not None:
                 await tt
                 await self.load_obj(db)
-        self._db = None
 
 
 async def setup_db_conn(conn):
@@ -1920,7 +2023,8 @@ async def main_async_func():
     dbexists = dbfn.exists()
     if DEBUG:
         dbexists = False
-        dbfn.unlink()
+        if dbfn.exists():
+            dbfn.unlink()
 
     try:
         async with httpx.AsyncClient(
