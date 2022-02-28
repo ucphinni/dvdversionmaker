@@ -872,27 +872,6 @@ class TaskLoader:
             return False
 
 
-class ConcatTaskSources(TaskLoader):
-    def __init__(self):
-        super().__init__()
-        self._finish_pos = None
-
-    def add_chunk(self, start_pos, chunk, block=True):
-        super().add_chunk(start_pos, chunk, block=block)
-        if self._finish_pos is None or self._finish_pos == start_pos:
-            return
-
-        next_running_afm = self._loaders.shift()
-        if next_running_afm is None:
-            return
-        # reset and advance
-        self._last_proc_chunk_end_pos = self._last_proc_chunk_start_pos = 0
-        next_running_afm._parent = self._source
-
-    async def handle_source_eos(self):
-        self._finish_pos = self._source.finished_size()
-
-
 class WorkMgr(ABC):
     def __init__(self, source):
         self._current_workmgr = self
@@ -1095,7 +1074,8 @@ class HashLoader(TaskLoader):
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
-    def __init__(self, cmd_ary, source):
+    def __init__(self, cmd_ary, source,
+                 stdout_fname, stderr_fname):
         super().__init__(source)
         self._cmd_ary = cmd_ary
         self._task = None
@@ -1104,17 +1084,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         self._process_terminated = False
         self._process_terminating = False
         self._cond = asyncio.Condition()
-
-    async def handle_stream_eof(self, stream):
-        pass
-
-    @abstractmethod
-    async def handle_stream(self, stream, buf):
-        pass
-
-    async def handle_stream_err(self, stream, e):
-        print("exception", stream, e)
-        return False
+        self._stdout_fname = stdout_fname
+        self._stderr_fname = stderr_fname
 
     async def run(self):
         if self._is_running_apel:
@@ -1146,46 +1117,29 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 await self._cond.wait()
         return
 
-    async def _start_cmd(self):
-        async def _read_stream(stream, obj):
-            while True:
-                if stream.is_closing():
-                    await asyncio.sleep(0)
-                    buf = await stream.read(1)
-                else:
-                    buf = await stream.read(4096)
-                print("read_stream read", self, len(buf))
-
-                if buf:
-                    try:
-                        await obj.handle_stream(stream, buf)
-                    except Exception as e:
-                        if not await obj.handle_stream_err(stream, e):
-                            raise e
-                else:
-                    await obj.handle_stream_eof(stream)
-                    break
-                if stream.at_eof():
-                    await obj.handle_stream_eof(stream)
-                    break
+    async def _start_cmd(
+            self, stdout_fname=None, stderr_fname=None):
         pid, rc = None, None
+        stdout = asyncio.subprocess.DEVNULL
+        stderr = asyncio.subprocess.DEVNULL
+
         try:
+            if stdout_fname is not None:
+                stdout = open(stdout_fname, "w+")
+            if stderr_fname is not None:
+                stderr = open(stderr_fname, "w+")
+
             async with self._cond:
                 self._proc = await asyncio.create_subprocess_exec(
                     *self._cmd_ary,
                     stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stdout=stdout,
+                    stderr=stderr
                 )
                 self._cond.notify_all()
                 proc = self._proc
-            aws = [
-                asyncio.create_task(_read_stream(proc.stdout, self)),
-                asyncio.create_task(_read_stream(proc.stderr, self)),
-            ]
             rc = await proc.wait()
             print("process done!!!")
-            await asyncio.gather(*aws)
             async with self._cond:
                 self._process_terminated = True
                 await self._cond.notify_all()
@@ -1193,6 +1147,10 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         except OSError as e:
             return e
         finally:
+            if stdout != asyncio.subprocess.DEVNULL:
+                stdout.close()
+            if stderr != asyncio.subprocess.DEVNULL:
+                stderr.close()
             print("proc done", self._taskme)
         return pid, rc
 
@@ -2020,6 +1978,7 @@ async def main():
     await CfgMgr.quit()
 
     # loop.stop()
+
 if __name__ == '__main__':
     loop = asyncio.new_event_loop()
     try:
