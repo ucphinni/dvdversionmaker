@@ -16,9 +16,7 @@ from PIL import ImageFont, ImageDraw, Image
 from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
-from anyio._backends._asyncio import CancelledError
 import httpx
-from mouseinfo import size
 
 
 print("RUNNING ::$Id: s.py,v 1.28 2022/02/13 08:31:18 ucphinni Exp ucphinni $")
@@ -102,8 +100,10 @@ class CfgMgr:
                     tb_info = traceback.extract_tb(tb)
                     filename, line, func, text = tb_info[-1]
 
-                    print(f'An error occurred on {filename}:{line} {func} in statement {text}'.format(
-                        line, text))
+                    print(f'An error occurred on '
+                          f'{filename}:{line} {func} '
+                          f'in statement {text}'.format(
+                              line, text))
                     exit(1)
                 print(repr(exc))
 
@@ -817,6 +817,9 @@ class TaskLoader:
             pos += m.nbytes
             await self._proc_chunk(start, m)
 
+            if not self._queue.empty():
+                break
+
     async def handle_task_run_done(self):
         pass
 
@@ -827,18 +830,19 @@ class TaskLoader:
         self._is_running = True
         assert self._source is not None
         try:
-            if self._source is not None:
-                self._read_from_file_gap_end = self._source._pos
+
             while self._is_running:
+                if self._source is not None:
+                    self._read_from_file_gap_end = self._source._pos
+                if (self._source._afh is not None and
+                        self._read_from_file_gap_end is not None and
+                        self._queue.empty()):
+                    await self._fill_gap_from_file()
+
                 chunk_item = await self._queue.get()
                 if chunk_item[0] is None and chunk_item[1] is None:
                     break
                 await self._proc_chunk(chunk_item[0], chunk_item[1])
-                if (self._afh is not None and
-                        self._read_from_file_gap_end is not None):
-                    await self._fill_gap_from_file()
-                    if self._queue.empty():
-                        await self._proc_chunk(chunk_item[0], chunk_item[1])
             fin_size = self._source.finished_size()
             assert fin_size is not None
             self._read_from_file_gap_end = self._last_proc_chunk_end_pos
@@ -1103,7 +1107,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         self._is_running_apel = False
         self._process_terminated = False
         self._process_terminating = False
-        self._lock = asyncio.Lock()
+        self._cond = asyncio.Condition()
 
     async def handle_stream_eof(self, stream):
         pass
@@ -1133,65 +1137,67 @@ class AsyncProcExecLoader(TaskLoader, ABC):
             print(f'An error occurred on {filename}:{line} {func}'
                   f' in statement {text}'.format(line, text))
             exit(1)
-        except:
+        except Exception:
             print(traceback.format_exc())
             raise
         print("awaiting cmd task", self._taskme)
-        cmd_task.cancel()
         await cmd_task
         print("asyncprocexecloader run done", self._taskme)
+
+    async def _wait_for_cmd_done(self):
+        async with self._cond:
+            while not self._process_terminated:
+                await self._cond.wait()
+        return
 
     async def _start_cmd(self):
         async def _read_stream(stream, obj):
             while True:
-                # await asyncio.sleep(0)
-                try:
-                    buf = await stream.read(obj._bufsz)
+                if stream.is_closing():
+                    await asyncio.sleep(0)
+                    buf = await stream.read(1)
+                else:
+                    buf = await stream.read(4096)
+                print("read_stream read", self, len(buf))
 
-                    if buf:
-                        try:
-                            await obj.handle_stream(stream, buf)
-                        except Exception as e:
-                            if not await obj.handle_stream_err(stream, e):
-                                raise e
-                    else:
-                        await obj.handle_stream_eof(stream)
-                        break
-                    if stream.at_eof():
-                        await obj.handle_stream_eof(stream)
-                        break
-                except CancelledError:
-                    continue
+                if buf:
+                    try:
+                        await obj.handle_stream(stream, buf)
+                    except Exception as e:
+                        if not await obj.handle_stream_err(stream, e):
+                            raise e
+                else:
+                    await obj.handle_stream_eof(stream)
+                    break
+                if stream.at_eof():
+                    await obj.handle_stream_eof(stream)
+                    break
         pid, rc = None, None
         try:
-            self._proc = await asyncio.create_subprocess_exec(
-                *self._cmd_ary,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            proc = self._proc
+            async with self._cond:
+                self._proc = await asyncio.create_subprocess_exec(
+                    *self._cmd_ary,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                self._cond.notify_all()
+                proc = self._proc
             aws = [
-                asyncio.create_task(proc.wait()),
                 asyncio.create_task(_read_stream(proc.stdout, self)),
                 asyncio.create_task(_read_stream(proc.stderr, self)),
             ]
-            rc, _, _ = asyncio.gather(*aws)
+            rc = await proc.wait()
+            print("process done!!!")
+            await asyncio.gather(*aws)
+            async with self._cond:
+                self._process_terminated = True
+                await self._cond.notify_all()
             pid = proc.pid
-        except CancelledError:
-            pass
         except OSError as e:
             return e
         finally:
             print("proc done", self._taskme)
-            while True:
-                print("In cancel loop")
-                _, aws = await asyncio.wait(aws, timeout=10)
-                for i in aws:
-                    i.cancel()
-                if len(aws) == 0:
-                    break
-            print("stream_handlers done", self._taskme)
         return pid, rc
 
     async def _handle_source_eos_if_self_at_end(self, stdin):
@@ -1215,13 +1221,6 @@ class AsyncProcExecLoader(TaskLoader, ABC):
             return ret
         return ret
 
-    async def _get_stdin(self):
-        if self._process_terminated:
-            return None
-        while self._proc is None:
-            await asyncio.sleep(0)
-        return self._proc.stdin
-
     async def handle_source_eos(self):
         await self._send_chunk(None)
 
@@ -1232,60 +1231,31 @@ class AsyncProcExecLoader(TaskLoader, ABC):
             pass
         else:
             return
-        stdin = await self._get_stdin()
-        async with self._lock:
-            if stdin is None:
-                return
-            if chunk is not None:
-                stdin.write(chunk)
-            if await self._handle_source_eos_if_self_at_end(stdin):
-                return
+        while True:
+            async with self._cond:
+                if self._process_terminated:
+                    return None
+                if self._proc is None:
+                    await self._cond.wait()
+                    continue
 
-            try:
+                stdin = self._proc.stdin
+                if stdin is None:
+                    return None
+
+                if chunk is not None:
+                    print("wrting in", self, len(chunk))
+                    stdin.write(chunk)
+                if await self._handle_source_eos_if_self_at_end(stdin):
+                    return None
+                break
+
+        try:
+            if chunk:
                 await stdin.drain()
-            except ConnectionResetError as e:
-                if chunk is None or self._process_terminated:
-                    pass
-                else:
-                    print("Connection Reset")
-                    raise e
-
-
-class SpuMuxWriter(AsyncProcExecLoader):
-    def __init__(self, source, xfn, mfn, bufsz=32768,
-                 spumux_exe=CfgMgr.SPUMUX):
-        self._xfn = xfn
-        exec_args = [
-            spumux_exe,
-            xfn
-        ]
-        super().__init__(exec_args, source)
-        self._mfn = mfn
-        self._afho = None
-        self._bufsz = bufsz
-
-    async def handle_task_run_done(self):
-        try:
-            # await self._proc.stdin.close()
+        except ConnectionResetError:
             pass
-        finally:
-            pass
-
-    async def handle_stream(self, stream, buf):
-        if stream == self._proc.stdout:
-            await self._afho.write(buf)
-            await self._afho.fsync()
-        elif stream == self._proc.stderr:
-            print(buf)
         return
-
-    async def run(self):
-        try:
-            async with AIOFile(self._mfn, 'wb+') as f:
-                self._afho = f
-                await super().run()
-        finally:
-            self._afho = None
 
 
 class AsyncStreamTaskMgr:
@@ -1772,157 +1742,170 @@ class OnlineConfigDbMgr:
                 continue
 
     async def create_setup_files(self, db):
+        files = []
+
         queries = self._queries
         ary = None
         fftasks = []
-
-        def ensure_file(fn):
-            file = Path(fn)
-            file.parent.mkdir(parents=True, exist_ok=True)
-            file.touch()
-            return file
-        drary, mfary, dvdary = await asyncio.gather(
-            queries.get_dvd_files(db),
-            queries.get_menu_files(db),
-            queries.get_all_dvdfilemenu_rows(db)
-        )
-
-        async def write_xmlrows2file(fn, rows):
-            async with AIOFile(fn, 'w') as f:
-                writer = Writer(f)
-                for tab, sstr in map(lambda r: (r['tab'], r['str']), rows):
-                    await writer((' ' * (2 * tab)) + sstr + '\n')
-
-        # dvdary = []
-        dvdfns = {}
-        for row in drary:
-            dvdfns[row['dvdnum']] = (CfgMgr.MENUDIR / row['pfn'],)
-        print("creating background")
-        create_background_pic(drary)
-        menusels = {}
-        menubuild_rm = defaultdict(lambda: {})
-        selfn = set()
-        await queries.delete_all_menubreaks(db)
-
-        for row in mfary:
-            # For right now, we will only use one menu selector per disk
-            dvdnum = row['dvdnum']
-            renum_menu = row['renum_menu']
-            sifn = fn = CfgMgr.MENUDIR / row['sifn']
-            if not fn.is_file() and fn not in selfn:
-                selfn.add(fn)
-                fftasks.append(CfgMgr.create_task(
-                    create_mensel(fn, 'sifn')))
-            ssfn = fn = CfgMgr.MENUDIR / row['ssfn']
-            if not fn.is_file() and fn not in selfn:
-                selfn.add(fn)
-                fftasks.append(CfgMgr.create_task(
-                    create_mensel(fn, 'ssfn')))
-            shfn = fn = CfgMgr.MENUDIR / row['shfn']
-            if not fn.is_file() and fn not in selfn:
-                selfn.add(fn)
-                fftasks.append(CfgMgr.create_task(
-                    create_mensel(fn, 'shfn')))
-            if dvdnum not in menusels:
-                menusels[dvdnum] = MenuSelector(sifn, shfn, ssfn)
-            mb = MenuBuilder(db, queries, dvdnum,
-                             renum_menu, sel=menusels[dvdnum])
-            menubuild_rm[dvdnum][renum_menu] = mb
-            await mb.gen_db_menubreak_rows(dvdfilemenu_ary=dvdary)
-        print("gather 1")
-        daary, dsary = await asyncio.gather(
-            queries.get_dvd_files(db),
-            queries.get_dvdmenu_files(db)
-        )
-        for row in mfary:
-            dvdnum = row['dvdnum']
-            renum_menu = row['renum_menu']
-            mb = menubuild_rm[dvdnum][renum_menu]
-            await mb.compute_header_footer()
-
-        print("done")
-        # for spumux
-        qq = []
-        mb = None
-        for row in dsary:
-            dvdnum = row['dvdnum']
-            dvdmenu = row['dvdmenu']
-            renum_menu = row['renum_menu']
-            pfn = CfgMgr.MENUDIR / row['pfn']
-            mfn = CfgMgr.MENUDIR / row['mfn']
-            xfn = CfgMgr.MENUDIR / row['xfn']
-
-            if renum_menu is None:
-                renum_menu = 0
-                print("found None 0")
-            mb = menubuild_rm[dvdnum][renum_menu]
-            print(dvdmenu, renum_menu, pfn)
-            mb.add_dvdmenu_fn(dvdmenu, pfn)
-            qq.append((dvdnum, dvdmenu, xfn))
-        print("done calc menus")
-        fftasks = []
-
-        for dvdnum in menubuild_rm.keys():
-            for renum_menu in menubuild_rm[dvdnum]:
-                fftasks.append(
-                    menubuild_rm[dvdnum][renum_menu].finish_files())
-        for i, _ in enumerate(qq):
-            xfn = CfgMgr.MENUDIR / qq[i][2]
-            ary = await queries.get_spumux_rows(
-                db, dvdnum=qq[i][0], dvdmenu=qq[i][1])
-            fftasks.append(write_xmlrows2file(xfn, ary))
-        # for dvdauthor
-        for dvdnum, xfn in map(
-            lambda row: (row['dvdnum'],
-                         ensure_file(CfgMgr.MENUDIR / row['xfn'])), daary):
-            await write_xmlrows2file(
-                xfn, await queries.get_dvdauthor_rows(
-                    db, dvdnum=dvdnum))
-        print("wait for tasks")
-        await asyncio.gather(*fftasks)
-        fftasks = []
-        print("done tasks")
-        for row in dsary:
-            dvdnum, dvdmenu, mfn, xfn, pfn, renum_menu = (
-                row['dvdnum'],
-                row['dvdmenu'],
-                CfgMgr.MENUDIR / row['mfn'],
-                CfgMgr.MENUDIR / row['xfn'],
-                CfgMgr.MENUDIR / row['pfn'],
-                row['renum_menu']
-            )
-            fftasks.append(loop.run_in_executor(None,
-                                                create_menu_mpg,
-                                                dvdfns[dvdnum][0],
-                                                pfn, mfn))
-        print("wait for menu mpg")
-        await CfgMgr.wait_tasks_complete(aws=fftasks)
-        fftasks = []
-        print("done menu mpg")
-        u = set()
-        for row in dsary:
-            mfn, xfn, mfn2 = (
-                CfgMgr.MENUDIR / row['mfn'],
-                CfgMgr.MENUDIR / row['xfn'],
-                CfgMgr.MENUDIR / row['mfn2'])
-            if xfn in u:
-                continue
-            print(xfn)
-            u.add(xfn)
-            procmgr = AsyncStreamTaskMgr(None, mfn)
-            spumuxwriter = SpuMuxWriter(procmgr, xfn, mfn2)
-            await procmgr.add_TaskLoader(spumuxwriter)
-            fftasks.append(CfgMgr.create_task(procmgr.run()))
-            spumuxwriter.run_task()
-
-        print("wait for spumux menu mpg")
         try:
-            await asyncio.gather(*fftasks)
-        except AssertionError:
-            traceback.print_exc()
-        print("done spumux menu mpg")
 
-        self._running_db_load = False
+            def ensure_file(fn):
+                file = Path(fn)
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+                return file
+            drary, mfary, dvdary = await asyncio.gather(
+                queries.get_dvd_files(db),
+                queries.get_menu_files(db),
+                queries.get_all_dvdfilemenu_rows(db)
+            )
+
+            async def write_xmlrows2file(fn, rows):
+                async with AIOFile(fn, 'w') as f:
+                    writer = Writer(f)
+                    for tab, sstr in map(lambda r: (r['tab'], r['str']), rows):
+                        await writer((' ' * (2 * tab)) + sstr + '\n')
+
+            # dvdary = []
+            dvdfns = {}
+            for row in drary:
+                dvdfns[row['dvdnum']] = (CfgMgr.MENUDIR / row['pfn'],)
+            print("creating background")
+            create_background_pic(drary)
+            menusels = {}
+            menubuild_rm = defaultdict(lambda: {})
+            selfn = set()
+            await queries.delete_all_menubreaks(db)
+
+            for row in mfary:
+                # For right now, we will only use one menu selector per disk
+                dvdnum = row['dvdnum']
+                renum_menu = row['renum_menu']
+                sifn = fn = CfgMgr.MENUDIR / row['sifn']
+                if not fn.is_file() and fn not in selfn:
+                    selfn.add(fn)
+                    fftasks.append(CfgMgr.create_task(
+                        create_mensel(fn, 'sifn')))
+                ssfn = fn = CfgMgr.MENUDIR / row['ssfn']
+                if not fn.is_file() and fn not in selfn:
+                    selfn.add(fn)
+                    fftasks.append(CfgMgr.create_task(
+                        create_mensel(fn, 'ssfn')))
+                shfn = fn = CfgMgr.MENUDIR / row['shfn']
+                if not fn.is_file() and fn not in selfn:
+                    selfn.add(fn)
+                    fftasks.append(CfgMgr.create_task(
+                        create_mensel(fn, 'shfn')))
+                if dvdnum not in menusels:
+                    menusels[dvdnum] = MenuSelector(sifn, shfn, ssfn)
+                mb = MenuBuilder(db, queries, dvdnum,
+                                 renum_menu, sel=menusels[dvdnum])
+                menubuild_rm[dvdnum][renum_menu] = mb
+                await mb.gen_db_menubreak_rows(dvdfilemenu_ary=dvdary)
+            print("gather 1")
+            daary, dsary = await asyncio.gather(
+                queries.get_dvd_files(db),
+                queries.get_dvdmenu_files(db)
+            )
+            for row in mfary:
+                dvdnum = row['dvdnum']
+                renum_menu = row['renum_menu']
+                mb = menubuild_rm[dvdnum][renum_menu]
+                await mb.compute_header_footer()
+
+            print("done")
+            # for spumux
+            qq = []
+            mb = None
+            for row in dsary:
+                dvdnum = row['dvdnum']
+                dvdmenu = row['dvdmenu']
+                renum_menu = row['renum_menu']
+                pfn = CfgMgr.MENUDIR / row['pfn']
+                mfn = CfgMgr.MENUDIR / row['mfn']
+                xfn = CfgMgr.MENUDIR / row['xfn']
+
+                if renum_menu is None:
+                    renum_menu = 0
+                    print("found None 0")
+                mb = menubuild_rm[dvdnum][renum_menu]
+                print(dvdmenu, renum_menu, pfn)
+                mb.add_dvdmenu_fn(dvdmenu, pfn)
+                qq.append((dvdnum, dvdmenu, xfn))
+            print("done calc menus")
+            fftasks = []
+
+            for dvdnum in menubuild_rm.keys():
+                for renum_menu in menubuild_rm[dvdnum]:
+                    fftasks.append(
+                        menubuild_rm[dvdnum][renum_menu].finish_files())
+            for i, _ in enumerate(qq):
+                xfn = CfgMgr.MENUDIR / qq[i][2]
+                ary = await queries.get_spumux_rows(
+                    db, dvdnum=qq[i][0], dvdmenu=qq[i][1])
+                fftasks.append(write_xmlrows2file(xfn, ary))
+            # for dvdauthor
+            for dvdnum, xfn in map(
+                lambda row: (row['dvdnum'],
+                             ensure_file(CfgMgr.MENUDIR / row['xfn'])), daary):
+                await write_xmlrows2file(
+                    xfn, await queries.get_dvdauthor_rows(
+                        db, dvdnum=dvdnum))
+            print("wait for tasks")
+            await asyncio.gather(*fftasks)
+            fftasks = []
+            print("done tasks")
+            for row in dsary:
+                dvdnum, dvdmenu, mfn, xfn, pfn, renum_menu = (
+                    row['dvdnum'],
+                    row['dvdmenu'],
+                    CfgMgr.MENUDIR / row['mfn'],
+                    CfgMgr.MENUDIR / row['xfn'],
+                    CfgMgr.MENUDIR / row['pfn'],
+                    row['renum_menu']
+                )
+                fftasks.append(loop.run_in_executor(None,
+                                                    create_menu_mpg,
+                                                    dvdfns[dvdnum][0],
+                                                    pfn, mfn))
+            print("wait for menu mpg")
+            await CfgMgr.wait_tasks_complete(aws=fftasks)
+            fftasks = []
+            print("done menu mpg")
+            u = set()
+            for row in dsary:
+                mfn, xfn, mfn2 = (
+                    CfgMgr.MENUDIR / row['mfn'],
+                    CfgMgr.MENUDIR / row['xfn'],
+                    CfgMgr.MENUDIR / row['mfn2'])
+                if xfn in u:
+                    continue
+                print(xfn)
+                exec_args = [
+                    CfgMgr.SPUMUX,
+                    xfn
+                ]
+                infile = open(mfn)
+                outfile = open(mfn2, 'w+')
+                errfile = open(mfn2.with_suffix('.stderr'), "w+")
+                files += [infile, outfile, errfile]
+
+                fftasks.append(asyncio.create_subprocess_exec(
+                    *exec_args, stdin=infile,
+                    stdout=outfile,
+                    stderr=errfile))
+                continue
+
+            print("wait for spumux menu mpg")
+            try:
+                await asyncio.gather(*fftasks)
+            except AssertionError:
+                traceback.print_exc()
+            print("done spumux menu mpg")
+        finally:
+            for f in files:
+                f.close()
+            self._running_db_load = False
 
     async def load(self):
         async with self._cond:
