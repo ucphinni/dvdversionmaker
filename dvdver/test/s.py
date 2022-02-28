@@ -5,11 +5,9 @@ from enum import IntEnum
 import hashlib
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
@@ -17,194 +15,7 @@ from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
 import httpx
-
-
-print("RUNNING ::$Id: s.py,v 1.28 2022/02/13 08:31:18 ucphinni Exp ucphinni $")
-
-
-class CfgMgr:
-    DLDIR = None
-    TRANSCODEDIR = None
-    MENUDIR = None
-    SQLFILE = None
-    SPUMUX = None
-    FFMPEG = None
-    _sgton = None
-
-    def __init__(self):
-        self._all_pending_tasks = set()
-        self._queue = asyncio.Queue()
-        self._bg_task_run = None
-
-    async def _run(self):
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                break
-            task = item
-            task.cancel()
-            self._queue.task_done()
-
-    async def _quit(self):
-        await self._queue.put(None)
-        await self._queue.join()
-        for t in self._all_pending_tasks:
-            t.cancel()
-        await asyncio.wait(self._all_pending_tasks)
-
-    @classmethod
-    def cancel(cls, task):
-        cls._sgton._cancel(task)
-
-    @classmethod
-    async def quit(cls):
-        await cls._sgton._quit()
-
-    def _cancel(self, task):
-        ctask = asyncio.current_task()
-        if ctask != task:
-            task.cancel()
-            return
-        if self._bg_task_run is None:
-            self._bg_task_ru = asyncio.create_task(self._run())
-        self._queue.put_nowait(task)
-
-    @classmethod
-    async def wait_tasks_complete(cls, awsary=None, aws=None, timeout=None):
-        coro = cls._sgton._wait_tasks_complete(
-            awsary=awsary, aws=aws, timeout=timeout)
-        return await coro
-
-    async def _wait_tasks_complete(self, awsary=None, aws=None, timeout=None):
-        assert not(awsary is not None and aws is None)
-        if awsary is not None:
-            raise NotImplementedError()
-        paws = set(aws)
-        if len(paws) == 0:
-            return (aws, set())
-
-        ret = await asyncio.wait(
-            paws, timeout=timeout,
-            return_when=asyncio.FIRST_EXCEPTION)
-        done, _ = ret
-        for i in done:
-            exc = i.exception()
-            if exc is not None:
-                if type(exc) == AssertionError:
-                    _, _, tb = sys.exc_info()
-                    traceback.print_tb(tb)  # Fixed format
-                    tb_info = traceback.extract_tb(tb)
-                    filename, line, func, text = tb_info[-1]
-
-                    print(f'An error occurred on '
-                          f'{filename}:{line} {func} '
-                          f'in statement {text}'.format(
-                              line, text))
-                    exit(1)
-                print(repr(exc))
-
-        return ret
-
-    async def _wait_tasks_complete2(self, awsary=None, aws=None, timeout=None):
-        assert not(awsary is not None and aws is None)
-        awsary_is_none = awsary is None
-        if aws is not None and awsary_is_none:
-            awsary = [aws]
-        pawsary = list(
-            map(lambda s: s.intersection(self._all_pending_tasks), awsary))
-        end_time = time.monotonic() + timeout if timeout is not None else None
-
-        while len(self._all_pending_tasks):
-            timeout = (
-                end_time - time.monotonic() if timeout is not None
-                else None)
-            if timeout is not None and timeout <= 0:
-                timeout = 0
-            _, self._all_pending_tasks = await asyncio.wait(
-                self._all_pending_tasks, timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED)
-            for i in pawsary:
-                i.intersection_update(self._all_pending_tasks)
-            if timeout is not None and timeout <= 0:
-                break
-            if next(
-                map(lambda _: True,
-                    filter(lambda item: len(item) == 0,
-                           pawsary)), False):
-                break
-        ret = []
-        for i, paws in enumerate(pawsary):
-            d = awsary[i].difference(paws)
-            p = paws
-
-            ret.append((d, p))
-        if awsary_is_none and aws is not None:
-            return ret[0]
-        if awsary_is_none:
-            return None
-
-        return ret
-
-    @classmethod
-    def create_task(cls, coro):
-        return cls._sgton._create_task(coro)
-
-    def _create_task(self, coro):
-        task = asyncio.create_task(coro)
-        self._all_pending_tasks.add(task)
-        return task
-
-    @classmethod
-    def set_paths(cls, dldir, sqlfile):
-        #        sys.modules['s'] = __module__
-        cls.DLDIR = Path(dldir)
-        if cls.DLDIR.exists() and cls.DLDIR.is_dir():
-            pass
-        else:
-            raise NotADirectoryError(f"DLDIR:{dldir}")
-        cls.SQLFILE = Path(sqlfile)
-        if cls.SQLFILE.exists() and cls.SQLFILE.is_file():
-            pass
-        else:
-            raise FileExistsError(f"No SQLFILE:{sqlfile}")
-        cls.SPUMUX = shutil.which('spumux')
-        cls.FFMPEG = shutil.which('ffmpeg')
-        if cls.SPUMUX is not None and cls.FFMPEG is not None:
-            return
-        dirs = map(lambda x: Path(os.environ[x]), [
-            'ProgramFiles(x86)', 'ProgramW6432'])
-        for d in dirs:
-            for s in [Path('DVDStyler') / 'bin']:
-                searchdir = d / s
-                if cls.FFMPEG is None:
-                    cls.FFMPEG = shutil.which('ffmpeg', path=searchdir)
-                if cls.SPUMUX is None:
-                    cls.SPUMUX = shutil.which('spumux', path=searchdir)
-
-        if cls.SPUMUX is None:
-            raise FileExistsError("No SPUMUX found")
-        if cls.FFMPEG is None:
-            raise FileExistsError("No FFMPEG found")
-
-        cls.MENUDIR = cls.DLDIR / 'menu'
-        if cls.MENUDIR.exists() and cls.MENUDIR.is_dir():
-            pass
-        elif cls.MENUDIR.exists():
-            raise NotADirectoryError(f"MENUDIR:{cls.MENUDIR}")
-        else:
-            cls.MENUDIR.mkdir()
-
-        cls.TRANSCODEDIR = cls.DLDIR / 'transcode'
-        if cls.TRANSCODEDIR.exists() and cls.TRANSCODEDIR.is_dir():
-            pass
-        elif cls.TRANSCODEDIR.exists():
-            raise NotADirectoryError(f"TRANSCODEDIR:{cls.TRANSCODEDIR}")
-        else:
-            cls.TRANSCODEDIR.mkdir()
-
-
-CfgMgr.set_paths(Path(__file__).parent / 'download_dir',
-                 Path(__file__).parent / 'dl.sql')
+from cfgmgr import CfgMgr
 
 
 def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
@@ -1697,7 +1508,7 @@ class OnlineConfigDbMgr:
 
     async def create_setup_files(self, db):
         files = []
-
+        loop = asyncio.get_running_loop()
         queries = self._queries
         ary = None
         fftasks = []
@@ -1969,19 +1780,3 @@ async def main_async_func():
         ocd = OnlineConfigDbMgr('file://t.tsv', session, dbfn)
         await ocd.run(dbexists=dbexists)
         print("done")
-
-
-async def main():
-    CfgMgr._sgton = CfgMgr()
-
-    await main_async_func()
-    await CfgMgr.quit()
-
-    # loop.stop()
-
-if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        loop.run_until_complete(ocd.stop())
