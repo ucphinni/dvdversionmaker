@@ -22,10 +22,6 @@ import httpx
 print("RUNNING ::$Id: s.py,v 1.28 2022/02/13 08:31:18 ucphinni Exp ucphinni $")
 
 
-class EndProgramException (Exception):
-    pass
-
-
 class CfgMgr:
     DLDIR = None
     TRANSCODEDIR = None
@@ -2009,15 +2005,12 @@ async def main_async_func():
         if dbfn.exists():
             dbfn.unlink()
 
-    try:
-        async with httpx.AsyncClient(
-                http2=True, follow_redirects=True) as session:
-            global ocd
-            ocd = OnlineConfigDbMgr('file://t.tsv', session, dbfn)
-            await ocd.run(dbexists=dbexists)
-            print("done")
-    except EndProgramException:
-        pass
+    async with httpx.AsyncClient(
+            http2=True, follow_redirects=True) as session:
+        global ocd
+        ocd = OnlineConfigDbMgr('file://t.tsv', session, dbfn)
+        await ocd.run(dbexists=dbexists)
+        print("done")
 
 
 async def main():
