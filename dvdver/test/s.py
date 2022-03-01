@@ -496,7 +496,7 @@ class TaskLoader:
                  '_finish_up', '_force_terminate', '_source', '_loaders',
                  '_parent')
 
-    async def add_TaskLoader(self, obj: "TaskLoader") -> None:
+    def add_TaskLoader(self, obj: "TaskLoader") -> None:
         self.run_task()  # noop if already running.
         obj.run_task()  # noop if already running.
         if obj not in self._loaders:
@@ -505,7 +505,7 @@ class TaskLoader:
         obj._source = self._source
         return self
 
-    async def remove_TaskLoader(self, obj: "TaskLoader") -> None:
+    def remove_TaskLoader(self, obj: "TaskLoader") -> None:
         self._loaders.remove(obj)
         return self
 
@@ -711,8 +711,8 @@ class WorkMgr(ABC):
         r._loaders = t._loaders
         t._loaders = []
         if self._current_workmgr._promoted:
-            await self._source.add_TaskLoader(r)
-            await self._source.remove_TaskLoader(t)
+            self._source.add_TaskLoader(r)
+            self._source.remove_TaskLoader(t)
             r.run_task()
             CfgMgr.cancel(t._taskme)
             await asyncio.sleep(0)
@@ -722,12 +722,12 @@ class WorkMgr(ABC):
         self._current_workmgr._promote_opt = True
         self._current_workmgr._promoted = True
         for t in self._current_workmgr._tasks:
-            await self._source.add_TaskLoader(t)
+            self._source.add_TaskLoader(t)
             t.run_task()
 
     async def demote(self, taskloaders, stop=True) -> None:
         for t in taskloaders:
-            await self._source.remove_TaskLoader(t)
+            self._source.remove_TaskLoader(t)
 
             if stop:
                 t.stop()
@@ -747,7 +747,7 @@ class WorkMgr(ABC):
     async def commit(self):
         if not self._current_workmgr._promote_opt:
             for t in self._current_workmgr._tasks:
-                await self._source.add_TaskLoader(t)
+                self._source.add_TaskLoader(t)
         oldts = self._current_workmgr._tasks
         self._current_workmgr._tasks = set()
         w = self.next_WorkMgr()
@@ -835,7 +835,7 @@ class HashLoader(TaskLoader):
         stored_hashstr = await ocd.get_file_hash(fn)
 
         if eos:
-            await self._source.remove_TaskLoader(self)
+            self._source.remove_TaskLoader(self)
             CfgMgr.cancel(self._taskme)
             computed_hashstr = self._hashalgo.digest()
 
@@ -1069,7 +1069,7 @@ class AsyncStreamTaskMgr:
             obj.set_afh(self._afh)
         return self
 
-    async def remove_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
+    def remove_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
         if obj in self._taskloaders:
             self._taskloaders.remove(obj)
         return
@@ -1290,6 +1290,137 @@ class OnlineConfigDbMgr:
         self._hash_fn_queue = []
         self._bg_task = None
         self._menubreak_ary = None
+        self.fn2astm = {}
+        self.fn2dvdnum = defaultdict(lambda: set())
+        self.replace_hash_on_fail = True
+        self.opt_hash = True
+        self.tcfn = {}
+        self.dvd_tasks = {}
+        self.currentfns = set()
+
+    async def process_dvd_files(self, dvdnum):
+        # run dvdauthor. Iso combine files.
+        pass
+
+    async def dvd_task(self, dvdnum):
+        try:
+            async with self._cond:
+                while True:
+                    x = set(filter(lambda x: dvdnum in self.fn2dvdnum[x] and
+                                   (self.tcfn[x] == "done"
+                                    or self.tcfn[x] == "err"),
+                                   self.tcfn.keys()))
+                    y = set(filter(lambda x: dvdnum in self.fn2dvdnum[x] and
+                                   self.tcfn[x] == "done",
+                                   self.tcfn.keys()))
+                    z = set(filter(lambda x: dvdnum in self.fn2dvdnum[x],
+                                   self.tcfn.keys()))
+                    if x == z:
+                        break
+                    await self._cond.wait()
+            if y == z:
+                await self.process_dvd_files(dvdnum)
+            else:
+                print(f"errors with 1 or more file for dvdtask {dvdnum}")
+        finally:
+            del self.dvd_tasks[dvdnum]
+
+    async def file_task(self, dvdnum, fn, url, ahttpclient, cmp):
+        try:
+            if cmp < 0:
+                async with self._cond:
+                    self.tcfn[fn] = 'done'
+                    self._cond.notify_all()
+                return
+
+            async with self._cond:
+                self.tcfn[fn] = 'start'
+                if dvdnum not in self.dvd_tasks:
+                    self.dvd_tasks[dvdnum] = asyncio.create_task(
+                        self.dvd_task(dvdnum))
+                if dvdnum not in self.fn2dvdnum[fn]:
+                    self.fn2dvdnum[fn].add(dvdnum)
+
+                self._cond.notify_all()
+                '''
+                If you are not the current fn, then delay your excution until
+                the current is done for all dvdnums
+                '''
+                if fn not in self.currentfns:
+                    while next(
+                        filter(lambda x: x in self.currentfns and
+                               not(self.tcfn[x] == "done"
+                                   or self.tcfn[x] == "err"),
+                               self.currentfns), False):
+                        await self._cond.wait()
+
+            if fn in self.fn2astm:
+                a = self.fn2astm[fn]
+            else:
+                fname = CfgMgr.DLDIR / fn
+                a = AsyncStreamTaskMgr(url=url, fname=fname,
+                                       ahttpclient=ahttpclient)
+                self.fn2astm[fn] = a
+                a.run_task()
+                w = SimpleSourceFileWorkLoader(fname, a)
+                hl = HashLoader(self, a, fn, w)
+                a.add_TaskLoader(hl)
+                tcloader = None
+                for tcn in (1, 2):
+                    tcloader = self.get_transcode_loader(fn, tcn)
+                    if tcloader is not None:
+                        break
+
+                if (self.opt_hash and tcloader is not None and
+                        not tcloader.is_running()):
+                    async with self._cond:
+                        self.tcfn[fn] = tcn
+                        self._cond.notify_all()
+                    tcloader.run_task()
+                    a.add_TaskLoader(tcloader)
+
+                await hl.wait_for_hash()
+                if not hl.hash_match():
+                    if fname.exists():
+                        fname.unlink()
+                    if self.replace_hash_on_fail:
+                        print(f"mismatch hash: {fn}. retry/replace")
+                        hl.reset_hash()
+                        await hl.wait_for_hash()
+                    if not hl.hash_match():
+                        async with self._cond:
+                            self.tcfn[fn] = 'err'
+                            self._cond.notify_all()
+                        raise ValueError(f"{fn}: Hash mismatch")
+                else:
+                    if (not self.opt_hash and tcloader is not None
+                            and not tcloader.is_running()):
+                        tcloader.run_task()
+                        a.add_TaskLoader(tcloader)
+
+                if tcn == 1 and tcloader is not None:
+                    tcn = 2
+                    async with self._cond:
+                        self.tcfn[fn] = tcn
+                        self._cond.notify_all()
+                    tcloader = self.get_transcode_loader(fn, tcn)
+                    tcloader.run_task()
+                    a.add_TaskLoader(tcloader)
+                async with self._cond:
+                    self.tcfn[fn] = 'done'
+                    self._cond.notify_all()
+                return  # Finished.
+
+        finally:
+            async with self._cond:
+                # Dont have to notify here. Save on signally.
+                self.currentfns.remove(fn)
+
+    def create_tc_task(
+            self,  dvdnum, fn, url, cmp, ahttpclient):
+        return asyncio.create_task(
+            self.file_task(
+                dvdnum, fn, url, ahttpclient, cmp))
 
     async def get_file_hash(self, fn):
         queries, db = self._queries, self._db
@@ -1680,51 +1811,37 @@ class OnlineConfigDbMgr:
             await self._bgmpg_task
             self._bgmpg_task = None
 
-    async def _periodic_notify(self):
-        try:
-            while not self._done:
-                async with self._cond:
-                    if not self._done:
-                        self._cond.notify()
-                    self._idle_wakeup = True
-                await asyncio.sleep(1)
-        except asyncio.exceptions.CancelledError:
-            print("Got Canceled")
-            self._done = True
-
     async def load_obj(self, db):
         queries = self._queries
-        s = self._session
         ary = await queries.get_filenames(db)
-        running_worklist = []
-        fndic = {}
+        fns = set()
+        fnst = set()
+        for r in ary:
+            dvdnum, fn, url, cmp = (r['dvdnum'], r['filename'],
+                                    r['dl_link'], r['cmp'])
+            if cmp == 0:
+                self.currentfns.add(fn)
 
-        for row in ary:
-            fn, url, cmp = row['filename'], row['dl_link'], row['cmp']
-            if cmp < 0:
-                continue
-            fname = CfgMgr.DLDIR / fn
-            stmgr = AsyncStreamTaskMgr(url=url, fname=fname, ahttpclient=s)
-            w = SimpleSourceFileWorkLoader(fname, stmgr)
-            await stmgr.add_WorkMgr(w)
-            stmgr.run_task()
-            hl = HashLoader(self, stmgr, fn, w)
-            w.add_TaskLoader(hl)
-            w.run_task()
-            await stmgr.add_TaskLoader(hl)
-            running_worklist.append(w)
-            fndic[w._taskme] = fn
+            t = self.create_tc_task(
+                dvdnum, fn, url, cmp, self._session)
+            fns.add(fn)
+            fnst.add(t)
 
-        if len(running_worklist):
-            print("wait on worklist")
-            wlset = set(map(lambda h: h._taskme, running_worklist))
-            while len(wlset):
-                done, wlset = await CfgMgr.wait_tasks_complete(
-                    aws=wlset, timeout=2)
-                for i in done:
-                    print("completion:", len(wlset), fndic[i])
+        # No locks required up to this point as there are no
+        # Contending tasks.  Even the above create_tc_task
+        # only schedules the task/coroutine to run, it doesnt
+        # run util you hit the first await.
 
-        print("done file load")
+        async with self._cond:
+            while set(self.tcfn.keys()) != fns:
+                await self._cond.wait()
+        '''
+        If the list changes, we are messed up anyway. So just take
+        the values and of the dvd_tasks and be done with it. No
+        condition variable locking required.
+        '''
+        await asyncio.gather(*self.dvd_tasks.values())
+        await asyncio.gather(*list(fnst))
 
     async def stop(self):
         async with self._cond:
