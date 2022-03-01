@@ -16,7 +16,7 @@ CREATE TEMP TABLE "dvdfile_incoming" as
 select * from dvdfile limit 0;
 DROP TABLE IF EXISTS procpassfile_tmp;
 CREATE TEMP TABLE procpassfile_tmp as
-WITH F AS (SELECT  df.filename,mia.tchash,
+WITH F AS (SELECT  df.filename,mia.dvdnum,
 CASE WHEN ( df.start_ver <= mia.version <=df.end_ver OR
 df.start_ver <= mia.version AND df.start_ver is not null and df.end_ver is NULL
  OR
@@ -36,12 +36,12 @@ left join passfile sf on (cf.filename = sf.filename)
 WHERE df.dvdnum = mia.dvdnum AND pf.filename = df.filename)
 SELECT * from F
 where rowid <> (SELECT min(rowid) FROM f
-GROUP BY f.filename,f.tchash
+GROUP BY f.filename,f.dvdnum
 HAVING count(*) > 1 AND MAX(cmp));
 
 -- name: finish_load#
-insert into makeisoavail(dvdnum,tchash)
-select distinct dvdnum dvdnum,1  from dvdfile_incoming dfi
+insert into makeisoavail(dvdnum)
+select distinct dvdnum dvdnum  from dvdfile_incoming dfi
 where not exists(select 1 from makeisoavail mia
  where dfi.dvdnum = mia.dvdnum);
 
@@ -101,34 +101,34 @@ from dvdfile_incoming;
 insert into procpassfile_history
 (
   summid,action,targetid,
-  filename,tchash, cmp,rowid, prowid, start_secs,
+  filename, cmp,rowid, prowid, start_secs,
   end_secs,pass1done,pass2done,downloadedhash,pass1hash,
   pass2hash
 )
 with f as (select 'del' act,a.id, 
-  a.filename,a.tchash, a.cmp,a.rowid, a.prowid,a.start_secs,
+  a.filename, a.cmp,a.rowid, a.prowid,a.start_secs,
   a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
   a.pass2hash
 from procpassfile as a left join procpassfile_tmp b
-  on a.tchash = b.tchash and a.filename = b.filename and
+  on a.filename = b.filename and
   a.prowid = b.prowid
-where b.tchash is NULL and b.filename is NULL  and a.prowid = b.prowid
+where b.filename is NULL  and a.prowid = b.prowid
 union all
 select 'add' act,NULL,
-  a.filename,a.tchash, a.cmp,a.rowid, a.prowid,a.start_secs,
+  a.filename, a.cmp,a.rowid, a.prowid,a.start_secs,
   a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
   a.pass2hash
 from procpassfile_tmp as a left join procpassfile b
-  on a.tchash = b.tchash and a.filename = b.filename and
+  on a.filename = b.filename and
   a.prowid = b.prowid
-where b.tchash is NULL and b.filename is NULL  and a.prowid = b.prowid
+where b.filename is NULL  and a.prowid = b.prowid
 union all
 select 'chg',a.id,
-  a.filename,a.tchash, a.cmp,a.rowid, a.prowid,a.start_secs,
+  a.filename,a.cmp,a.rowid, a.prowid,a.start_secs,
   a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
   a.pass2hash
 from procpassfile a inner join procpassfile_tmp b
-on (a.filename = b.filename and a.tchash = b.tchash and a.prowid = b.prowid)
+on (a.filename = b.filename and a.prowid = b.prowid)
 where a.cmp is b.cmp and a.rowid  is b.rowid and
    a.start_secs is b.start_secs and
    a.end_secs is b.end_secs  and a.pass1done is b.pass1done and
@@ -141,10 +141,10 @@ select (select max(id) from procpassfile_summary)id, f.* from f;
 
 delete from procpassfile;
 INSERT INTO procpassfile
-("filename","tchash","cmp","rowid","prowid",
+("filename","cmp","rowid","prowid",
 "start_secs","end_secs","pass1done","pass2done",
 "downloadedhash","pass1hash","pass2hash")
-select "filename","tchash","cmp","rowid","prowid",
+select "filename","cmp","rowid","prowid",
 "start_secs","end_secs","pass1done","pass2done",
 "downloadedhash","pass1hash","pass2hash" from procpassfile_tmp;
 
@@ -198,15 +198,8 @@ CREATE TABLE "makeisoavail" (
 	"version"	INTEGER NOT NULL DEFAULT 1,
 	"bitrate"	INTEGER NOT NULL DEFAULT 2000000,
 	"maxisosize"	INTEGER NOT NULL DEFAULT 4700372992,
-	"delete_older_unused_pass1"
-	BOOLEAN NOT NULL DEFAULT 0 CHECK(
-	"delete_older_unused_pass1" = 0 OR "delete_older_unused_pass1" = 1),
-	"delete_older_unused_pass2"
-	BOOLEAN NOT NULL DEFAULT 0 CHECK(
-	"delete_older_unused_pass2" = 0 OR "delete_older_unused_pass2" = 1),
 	"active"	BOOLEAN NOT NULL
 	DEFAULT 0 CHECK("active" = 0 OR "active" = 1),
-	"tchash"	INTEGER NOT NULL,
 	PRIMARY KEY("dvdnum")
 );
 
@@ -231,7 +224,6 @@ CREATE TABLE "passfile" (
 	"id"	INTEGER NOT NULL,
 
 "filename"	TEXT NOT NULL,
-"tchash"	INTEGER NOT NULL DEFAULT 1,
 "pass1done"	BOOLEAN NOT NULL DEFAULT 0
 CHECK("pass1done" = 0 OR "pass1done" = 1),
 "pass1hash"	TEXT CHECK(NOT "pass1done" OR
@@ -272,7 +264,6 @@ ON DELETE RESTRICT ON UPDATE CASCADE
 CREATE TABLE "procpassfile" (
 	"id"	INTEGER NOT NULL,
 	"filename"	TEXT NOT NULL,
-	"tchash"	INTEGER NOT NULL,
 	"cmp"	INTEGER NOT NULL,
 	"rowid"	INTEGER NOT NULL,
 	"prowid"	INTEGER NOT NULL,
@@ -298,7 +289,6 @@ CREATE TABLE "procpassfile_history" (
 	"action"	TEXT NOT NULL,
 	"targetid"	INTEGER,
 	"filename"	TEXT NOT NULL,
-	"tchash"	INTEGER NOT NULL,
 	"cmp"	INTEGER NOT NULL,
 	"rowid"	INTEGER NOT NULL,
 	"prowid"	INTEGER,
@@ -777,7 +767,7 @@ VALUES
 
 
 -- name: get_filenames
-WITH F AS (SELECT  df.filename,mia.tchash,
+WITH F AS (SELECT  df.filename,df.dvdnum,
 CASE WHEN ( df.start_ver <= mia.version <=df.end_ver OR
 df.start_ver <= mia.version AND df.start_ver is not null and df.end_ver is NULL
  OR
@@ -794,7 +784,7 @@ left join passfile sf on (cf.filename = sf.filename)
 WHERE df.dvdnum = mia.dvdnum AND pf.filename = df.filename)
 SELECT * from F
 where rowid NOT IN (SELECT min(rowid) FROM f
-GROUP BY f.filename,f.tchash
+GROUP BY f.filename,f.dvdnum
 HAVING count(*) > 1 AND MAX(cmp));
 
 -- name: get_menu_files
