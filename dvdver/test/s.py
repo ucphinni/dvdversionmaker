@@ -11,18 +11,73 @@ import sys
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
-from aiofile import (AIOFile, LineReader, Writer, Reader)
+import aiofiles
+# from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
 import httpx
 from cfgmgr import CfgMgr
+
+# https://stackoverflow.com/questions/64395127/how-do-i-write-a-async-decorator-that-restores-the-cwd
+
+
+class CoroWrapper:
+    """Wrap ``target`` to have every send issued in a ``context``"""
+
+    def __init__(self, target: 'Coroutine', context: 'ContextManager'):
+        self.target = target
+        self.context = context
+
+    # wrap an iterator for use with 'await'
+    def __await__(self):
+        # unwrap the underlying iterator
+        target_iter = self.target.__await__()
+        # emulate 'yield from'
+        iter_send, iter_throw = target_iter.send, target_iter.throw
+        send, message = iter_send, None
+        while True:
+            # communicate with the target coroutine
+            try:
+                with self.context:
+                    signal = send(message)
+            except StopIteration as err:
+                return err.value
+            else:
+                send = iter_send
+            # communicate with the ambient event loop
+            try:
+                message = yield signal
+            except BaseException as err:
+                send, message = iter_throw, err
+
+# copy CoroWrapper from https://stackoverflow.com/a/56079900/1600898
+
+
+class PreserveDir:
+    def __init__(self):
+        self.inner_dir = None
+
+    def __enter__(self):
+        self.outer_dir = os.getcwd()
+        if self.inner_dir is not None:
+            os.chdir(self.inner_dir)
+
+    def __exit__(self, *_):
+        self.inner_dir = os.getcwd()
+        os.chdir(self.outer_dir)
+
+
+def preserve_dir(fn):
+    async def wrapped(*args, **kwds):
+        return await CoroWrapper(fn(*args, **kwds), PreserveDir())
+    return wrapped
 
 
 def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
                     E_BR='500k', VBV_MBR='9800k', E_MIK=18,
                     E_DAR='16:9', E_SZ='720x480', E_FR='30000/1001',
                     E_SAR='32:27',
-                    PASS_LOG=None, OUTFILE=None):
+                    PASS_LOG='PassLog', OUTFILE=None):
     E_INTRA = "08,16,16,16,17,18,21,24,16,16,16,16,17,19,22,25,16,16,17,"
     E_INTRA += "18,20,22,25,29,16,16,18,21,24,27,31,36,17,17,20,24,30,35,"
     E_INTRA += "41,47,18,19,22,27,35,44,54,65,21,22,25,31,41,54,70,88,24,"
@@ -55,7 +110,7 @@ def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
     ss = ''
     sr = ''
     i = 0
-    for fn in fns[0]:
+    for fn in fns:
         ret.append('-i')
         ret.append(str(CfgMgr.DLDIR / fn))
         sr += f'[{i}:v:0]scale={E_SZ}:interl=-1,setsar={E_SAR}[V{i}];'
@@ -64,7 +119,7 @@ def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
             ss += f'[{i}:a:0]'
         i += 1
     ret.append('-filter_complex')
-    n = len(fns[0])
+    n = len(fns)
     if pass2:
         ss += f'concat=n={n}:v=1:a=1[outv][outa]'
     else:
@@ -548,7 +603,7 @@ class TaskLoader:
         self._parent = None
         self._source = source
 
-    def set_afh(self, afh: AIOFile):
+    def set_afh(self, afh):
         self._afh = afh
         if self._source is not None:
             pos = self._source._pos
@@ -610,12 +665,15 @@ class TaskLoader:
     def stop(self):
         self._is_running = False
 
+    def is_running(self):
+        return self._is_running
+
     async def _fill_gap_from_file(self):
         pos = self._last_proc_chunk_end_pos
-        reader = Reader(self._afh, offset=pos, chunk_size=512 * 1024)
+        await self._afh.seek(pos, os.SEEK_SET)
         while self._is_running:
             start = pos
-            chunk = await reader.read_chunk()
+            chunk = await self._afh.read(512 * 1024)
             if not chunk:
                 return
             m = memoryview(chunk)
@@ -823,48 +881,39 @@ class HashLoader(TaskLoader):
         self._any_work_done = None
         self._hashalgo = hashlib.blake2b()
         self._ocd = ocd
+        self._cond = asyncio.Condition()
+
+    async def reset_hash(self):
+        async with self._cond:
+            self._hashstr = self._computed_hashstr = None
+            self._cond.notify_all()
+
+    async def wait_for_hash(self):
+        async with self._cond:
+            while (self._hashstr is None or
+                   self._computed_hashstr is None):
+                await self._cond.wait()
 
     async def handle_source_eos(self):
         self.add_chunk(None, None)
 
-    async def finish_up(self, eos=True):
+    async def finish_up(self):
         if self._taskme is None:
             return
 
         ocd, fn = self._ocd, self._fn
         stored_hashstr = await ocd.get_file_hash(fn)
+        self._source.remove_TaskLoader(self)
+        CfgMgr.cancel(self._taskme)
+        computed_hashstr = self._hashalgo.digest()
 
-        if eos:
-            self._source.remove_TaskLoader(self)
-            CfgMgr.cancel(self._taskme)
-            computed_hashstr = self._hashalgo.digest()
-
-        if eos and stored_hashstr is None:
+        if stored_hashstr is None:
             await ocd.replace_hash_fn(computed_hashstr, fn)
+        async with self._cond:
+            self._hashstr = stored_hashstr
+            self._computed_hashstr = computed_hashstr
+            self._cond.notify_all()
 
-        if eos and (computed_hashstr == stored_hashstr
-                    or stored_hashstr is None):
-            await self._workobj.commit()
-            return
-
-        if eos:  # and computed_hastr != stored_hashstr
-            print("hash mismatch. Recompute")
-            # Hash mismatch. Start over and delete
-            # from database the stored hash. clean slate.
-
-            restartable = await self._workobj.rollback()
-            if restartable:
-                # Commit suicide but hand off the responsibly
-                # to a fresh new hashloader.
-
-                new_hl = HashLoader(self._ocd, fn, self._workobj)
-                await self._workobj.replace_TaskLoader(self, new_hl)
-                CfgMgr.cancel(self._taskme)
-                await asyncio.sleep(0)
-            return
-        # Promote always with not eos. will take care of resetting
-        # if hash is wrong later.  (See above)
-        await self._workobj.promote_optimistic()
         return
 
     def update_hash(self, chunk) -> None:
@@ -875,18 +924,14 @@ class HashLoader(TaskLoader):
         size = self._source.finished_size()
         if size is not None and self._last_proc_chunk_end_pos >= size:
             self.update_hash(chunk)
-            await self.finish_up(eos=True)
+            await self.finish_up()
             return
-
-        if self._last_proc_chunk_start_pos == 0 and size is None:
-            self._any_work_done = self._workobj.any_work_done()
-            await self.finish_up(eos=False)
         self.update_hash(chunk)
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
     def __init__(self, cmd_ary, source,
-                 stdout_fname, stderr_fname):
+                 stdout_fname, stderr_fname, cwd):
         super().__init__(source)
         self._cmd_ary = cmd_ary
         self._task = None
@@ -897,12 +942,16 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         self._cond = asyncio.Condition()
         self._stdout_fname = stdout_fname
         self._stderr_fname = stderr_fname
+        self._cwd = cwd
 
     async def run(self):
         if self._is_running_apel:
             return
         self._is_running_apel = True
-        cmd_task = CfgMgr.create_task(self._start_cmd())
+        cmd_task = CfgMgr.create_task(self._start_cmd(
+            stdout_fname=self._stdout_fname,
+            stderr_fname=self._stderr_fname,
+            cwd=self._cwd))
         print("asyncprocexecloader run start", self._taskme)
         try:
             await super().run()
@@ -928,8 +977,10 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 await self._cond.wait()
         return
 
+    #@preserve_dir
     async def _start_cmd(
-            self, stdout_fname=None, stderr_fname=None):
+            self, stdout_fname=None, stderr_fname=None,
+            cwd=None):
         pid, rc = None, None
         stdout = asyncio.subprocess.DEVNULL
         stderr = asyncio.subprocess.DEVNULL
@@ -939,14 +990,16 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 stdout = open(stdout_fname, "w+")
             if stderr_fname is not None:
                 stderr = open(stderr_fname, "w+")
-
+            if cwd is not None:
+                os.chdir(cwd)
+            p = await asyncio.create_subprocess_exec(
+                *self._cmd_ary,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=stdout,
+                stderr=stderr
+            )
             async with self._cond:
-                self._proc = await asyncio.create_subprocess_exec(
-                    *self._cmd_ary,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=stdout,
-                    stderr=stderr
-                )
+                self._proc = p
                 self._cond.notify_all()
                 proc = self._proc
             rc = await proc.wait()
@@ -1058,13 +1111,12 @@ class AsyncStreamTaskMgr:
         while not self._running:
             await asyncio.sleep(0.01)
 
-    async def add_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
+    def add_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
         if obj in self._taskloaders:
             return
         self.run_task()  # noop if already running
         obj.run_task()  # noop if already running
         self._taskloaders.append(obj)
-        await self.wait_for_started()
         if self._afh is not None:
             obj.set_afh(self._afh)
         return self
@@ -1115,8 +1167,7 @@ class AsyncStreamTaskMgr:
         resume_header = None
         pos = 0
         if filename != '':
-            f = AIOFile(self._fname, 'rb+')
-            await f.open()
+            f = await aiofiles.open(self._fname, 'rb+')
         try:
             if filename != '':
                 self._afh = f
@@ -1302,6 +1353,34 @@ class OnlineConfigDbMgr:
         # run dvdauthor. Iso combine files.
         pass
 
+    def get_transcode_loader(self, fn, tcn, source, row=''):
+        class PassLoader(AsyncProcExecLoader):
+            def __init__(self, dirobj, fn,
+                         tcn, source, cmd_ary):
+                stderr_fname = (dirobj / fn).with_suffix('.stderr')
+                self.tcn = tcn
+                super().__init__(
+                    cmd_ary, source,
+                    stdout_fname=None,
+                    stderr_fname=str(stderr_fname),
+                    cwd=str(dirobj))
+        g = hashlib.blake2b(digest_size=16)
+        g.update(bytes(row + str(fn), "utf-8"))
+        dfrowhash = g.hexdigest()
+        dirobj = CfgMgr.TRANSCODEDIR / dfrowhash
+        dirobj.mkdir(parents=True, exist_ok=True)
+
+        if tcn == 1:
+            cmd_ary = ffmpeg_cmd2pass(
+                *[CfgMgr.DLDIR / fn], pass1=True)
+        else:
+            cmd_ary = ffmpeg_cmd2pass(
+                *[CfgMgr.DLDIR / fn], pass2=True,
+                OUTFILE=str(dirobj / fn))
+
+        pl = PassLoader(dirobj, fn, tcn, source, cmd_ary)
+        return pl
+
     async def dvd_task(self, dvdnum):
         try:
             async with self._cond:
@@ -1367,7 +1446,7 @@ class OnlineConfigDbMgr:
                 a.add_TaskLoader(hl)
                 tcloader = None
                 for tcn in (1, 2):
-                    tcloader = self.get_transcode_loader(fn, tcn)
+                    tcloader = self.get_transcode_loader(fn, tcn, a)
                     if tcloader is not None:
                         break
 
@@ -1619,8 +1698,8 @@ class OnlineConfigDbMgr:
             fn = Path(fn[7:])
             if not fn.is_absolute():
                 fn = CfgMgr.DLDIR / fn
-            async with AIOFile(fn, 'r') as f:
-                await self._parse_streamed_lines(LineReader(f), db)
+            async with aiofiles.open(fn, 'r', encoding="utf-8") as f:
+                await self._parse_streamed_lines(f, db)
             return
         session = self._session
         while True:
@@ -1657,10 +1736,9 @@ class OnlineConfigDbMgr:
             )
 
             async def write_xmlrows2file(fn, rows):
-                async with AIOFile(fn, 'w') as f:
-                    writer = Writer(f)
+                async with aiofiles.open(fn, 'w') as f:
                     for tab, sstr in map(lambda r: (r['tab'], r['str']), rows):
-                        await writer((' ' * (2 * tab)) + sstr + '\n')
+                        await f.write((' ' * (2 * tab)) + sstr + '\n')
 
             # dvdary = []
             dvdfns = {}
