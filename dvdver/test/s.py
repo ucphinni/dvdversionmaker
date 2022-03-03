@@ -110,9 +110,17 @@ def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
     ss = ''
     sr = ''
     i = 0
+    use_stdin = False
+    if len(fns) == 0:
+        fns = ['-']
+        use_stdin = True
+
     for fn in fns:
         ret.append('-i')
-        ret.append(str(CfgMgr.DLDIR / fn))
+        if use_stdin:
+            ret.append(fn)
+        else:
+            ret.append(str(CfgMgr.DLDIR / fn))
         sr += f'[{i}:v:0]scale={E_SZ}:interl=-1,setsar={E_SAR}[V{i}];'
         ss += f'[V{i}]'
         if pass2:
@@ -589,12 +597,8 @@ class TaskLoader:
                 await asyncio.sleep(.5)
 
     def __init__(self, source, max_qsize=20):
-        self._done_file_sz = None
-        self._queue = asyncio.Queue(maxsize=max_qsize)
+        self.max_qsize = max_qsize
         self._is_running = False
-        self._last_proc_chunk_start_pos = 0
-        self._last_proc_chunk_end_pos = 0
-        self._read_from_file_gap_end = None
         self._taskme = None
         self._cond = asyncio.Condition()
         self._finish_up = False
@@ -602,6 +606,16 @@ class TaskLoader:
         self._loaders = []
         self._parent = None
         self._source = source
+        self.reset()
+
+    def reset(self):
+        self._queue = asyncio.Queue(maxsize=self.max_qsize)
+        self._last_proc_chunk_start_pos = 0
+        self._last_proc_chunk_end_pos = 0
+        self._read_from_file_gap_end = None
+        self._done_file_sz = None
+        if (self._is_running and self._afh is not None):
+            self.set_afh(self._afh)
 
     def set_afh(self, afh):
         self._afh = afh
@@ -839,78 +853,54 @@ class WorkMgr(ABC):
         return self._taskme
 
 
-class SimpleSourceFileWorkLoader(WorkMgr):
-    def __init__(self, fn, source):
-        super().__init__(source)
-        self._fn = Path(fn)
-        self._workmgrs = []
-
-    def next_WorkMgr(self):
-        if len(self._workmgrs):
-            self._current_workmgr = self._workmgrs.pop(0)
-        else:
-            self._current_workmgr = None
-        return self._current_workmgr
-
-    def add_WorkMgr(self, w: "WorkMgr") -> None:
-        self._workmgrs(w)
-
-    def any_work_done(self) -> bool:
-        return self._fn.exists()
-
-    async def rollback(self) -> bool:
-        source = self._source
-        if source.is_offline():
-            return False
-        try:
-            source.cancel()
-            return super().rollback()
-        finally:
-            return False
-
-
 class HashLoader(TaskLoader):
-    def __init__(self, ocd, source, fn, workobj: WorkMgr):
+    def __init__(self, ocd, source, fn):
         super().__init__(source)
         self._hashstr = None
         self._computed_hashstr = None
 #        self._pos = 0
         self._finish_pos = None
         self._fn = fn
-        self._workobj = workobj
-        self._any_work_done = None
         self._hashalgo = hashlib.blake2b()
         self._ocd = ocd
         self._cond = asyncio.Condition()
 
-    async def reset_hash(self):
-        async with self._cond:
-            self._hashstr = self._computed_hashstr = None
-            self._cond.notify_all()
+    def reset(self):
+        self._hashstr = self._computed_hashstr = None
 
     async def wait_for_hash(self):
         async with self._cond:
-            while (self._hashstr is None or
-                   self._computed_hashstr is None):
+            while (self._computed_hashstr is None):
                 await self._cond.wait()
+
+    def hash_match(self):
+        if self._hashstr is None:
+            return None
+        return (self._hashstr is not None and
+                self._computed_hashstr == self._hashstr)
 
     async def handle_source_eos(self):
         self.add_chunk(None, None)
+
+    async def load_db_hash(self, fn):
+        async with self._cond:
+            self._hashstr = await ocd.get_file_hash(fn)
+
+    async def db_hash_exists(self):
+        async with self._cond:
+            return self._hashstr is not None
 
     async def finish_up(self):
         if self._taskme is None:
             return
 
         ocd, fn = self._ocd, self._fn
-        stored_hashstr = await ocd.get_file_hash(fn)
         self._source.remove_TaskLoader(self)
-        CfgMgr.cancel(self._taskme)
         computed_hashstr = self._hashalgo.digest()
 
-        if stored_hashstr is None:
+        if self._hashstr is None:
             await ocd.replace_hash_fn(computed_hashstr, fn)
         async with self._cond:
-            self._hashstr = stored_hashstr
             self._computed_hashstr = computed_hashstr
             self._cond.notify_all()
 
@@ -977,7 +967,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 await self._cond.wait()
         return
 
-    #@preserve_dir
+    @preserve_dir
     async def _start_cmd(
             self, stdout_fname=None, stderr_fname=None,
             cwd=None):
@@ -1003,7 +993,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 self._cond.notify_all()
                 proc = self._proc
             rc = await proc.wait()
-            print("process done!!!")
+            print("process done!!!", rc)
             async with self._cond:
                 self._process_terminated = True
                 await self._cond.notify_all()
@@ -1039,8 +1029,9 @@ class AsyncProcExecLoader(TaskLoader, ABC):
             return ret
         return ret
 
-    async def handle_source_eos(self):
+    async def handle_source_eos(self, exc=None):
         await self._send_chunk(None)
+        exc = exc
 
     async def _send_chunk(self, chunk):
         if chunk is None:
@@ -1071,14 +1062,16 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         try:
             if chunk:
                 await stdin.drain()
-        except ConnectionResetError:
-            pass
+        except ConnectionResetError as e:
+            self.handle_source_eos(exc=e)
+        except BrokenPipeError as e:
+            self.handle_source_eos(exc=e)
         return
 
 
 class AsyncStreamTaskMgr:
     __slots__ = ('_afh', '_ahttpclient', '_taskloaders', '_url', '_fname',
-                 '_taskme', '_pos', '_taskme', '_running', '_workmgrs')
+                 '_taskme', '_pos', '_taskme', '_running')
 
     def __init__(self, url: str = None, fname: Path = None,
                  ahttpclient: httpx.AsyncClient = None):
@@ -1090,10 +1083,12 @@ class AsyncStreamTaskMgr:
         self._pos = None
         self._running = False
         self._taskme = None
-        self._workmgrs = []
 
-    async def add_WorkMgr(self, w: WorkMgr):
-        self._workmgrs.append(w)
+    async def truncate_file(self):
+        self._pos = 0
+        for t in self._taskloaders:
+            t.reset()
+        await self._afh.truncate()
 
     def is_offline(self):
         return self._url is None or self._afh is None
@@ -1259,9 +1254,6 @@ class AsyncStreamTaskMgr:
         for i in self._taskloaders:
             while not i._is_running:
                 await asyncio.sleep(0)
-        wml = map(lambda x: x._taskme, self._workmgrs)
-        aws = set(list(wml))
-        await CfgMgr.wait_tasks_complete(aws=aws)
 
     def finished_size(self):
         if self._taskme is None or self._url is None:
@@ -1348,6 +1340,8 @@ class OnlineConfigDbMgr:
         self.tcfn = {}
         self.dvd_tasks = {}
         self.currentfns = set()
+        self.dlcnt = 65536
+        self.passcnt = 4
 
     async def process_dvd_files(self, dvdnum):
         # run dvdauthor. Iso combine files.
@@ -1364,6 +1358,11 @@ class OnlineConfigDbMgr:
                     stdout_fname=None,
                     stderr_fname=str(stderr_fname),
                     cwd=str(dirobj))
+
+            def get_exception(self):
+                if self._taskme is not None:
+                    return self._taskme.get_exception()
+                return None
         g = hashlib.blake2b(digest_size=16)
         g.update(bytes(row + str(fn), "utf-8"))
         dfrowhash = g.hexdigest()
@@ -1372,10 +1371,10 @@ class OnlineConfigDbMgr:
 
         if tcn == 1:
             cmd_ary = ffmpeg_cmd2pass(
-                *[CfgMgr.DLDIR / fn], pass1=True)
+                *[], pass1=True)
         else:
             cmd_ary = ffmpeg_cmd2pass(
-                *[CfgMgr.DLDIR / fn], pass2=True,
+                *[], pass2=True,
                 OUTFILE=str(dirobj / fn))
 
         pl = PassLoader(dirobj, fn, tcn, source, cmd_ary)
@@ -1404,34 +1403,71 @@ class OnlineConfigDbMgr:
         finally:
             del self.dvd_tasks[dvdnum]
 
+    async def fn_wait(self, fn, start=False, download=False,
+                      pass1=False, pass2=False, download_done=False,
+                      pass_done=False, fast_hash=False):
+        async with self._cond:
+            '''
+            If you are not the current fn, then delay your excution until
+            the current is done for all dvdnums
+            '''
+            if start:
+                if fn not in self.currentfns:
+                    while next(
+                        filter(lambda x: x in self.currentfns and
+                               not(self.tcfn[x][0] == "done"
+                                   or self.tcfn[x][0] == "err"),
+                               self.currentfns), False):
+                        await self._cond.wait()
+            if download:
+                while (self.dlcnt <= 0 and not fast_hash) or (
+                    fn not in self.currentfns and next(
+                        filter(lambda x, self=self:
+                               x not in self.tcfn or
+                               self.tcfn[x][0] not in [
+                                   "pass", "wait4pass", "done", "err"],
+                               self.currentfns), '') != ''):
+                    await self._cond.wait()
+                if not fast_hash:  # fast hash does not count.
+                    self.dlcnt -= 1
+            if download_done:
+                assert not fast_hash
+                self.dlcnt += 1
+                self._cond.notify_all()
+            if pass1 or pass2:
+                while self.passcnt <= 0 or (fn not in self.currentfns and next(
+                    filter(lambda x, self=self:
+                           x not in self.tcfn or
+                           self.tcfn[x][0] not in [
+                               "done", "err"],
+                           self.currentfns), '') != ''):
+                    await self._cond.wait()
+                self.passcnt -= 1
+            if pass_done:
+                self.passcnt += 1
+                self._cond.notify_all()
+
     async def file_task(self, dvdnum, fn, url, ahttpclient, cmp):
         try:
             if cmp < 0:
                 async with self._cond:
-                    self.tcfn[fn] = 'done'
+                    self.tcfn[fn] = ('done',)
                     self._cond.notify_all()
-                return
+                return fn, self.tcfn[fn]
+
+            dtask = None
+            if dvdnum not in self.dvd_tasks:
+                dtask = asyncio.create_task(
+                    self.dvd_task(dvdnum))
 
             async with self._cond:
-                self.tcfn[fn] = 'start'
-                if dvdnum not in self.dvd_tasks:
-                    self.dvd_tasks[dvdnum] = asyncio.create_task(
-                        self.dvd_task(dvdnum))
+                self.tcfn[fn] = ('start',)
+                if dtask:
+                    self.dvd_tasks[dvdnum] = dtask
                 if dvdnum not in self.fn2dvdnum[fn]:
                     self.fn2dvdnum[fn].add(dvdnum)
 
                 self._cond.notify_all()
-                '''
-                If you are not the current fn, then delay your excution until
-                the current is done for all dvdnums
-                '''
-                if fn not in self.currentfns:
-                    while next(
-                        filter(lambda x: x in self.currentfns and
-                               not(self.tcfn[x] == "done"
-                                   or self.tcfn[x] == "err"),
-                               self.currentfns), False):
-                        await self._cond.wait()
 
             if fn in self.fn2astm:
                 a = self.fn2astm[fn]
@@ -1439,56 +1475,112 @@ class OnlineConfigDbMgr:
                 fname = CfgMgr.DLDIR / fn
                 a = AsyncStreamTaskMgr(url=url, fname=fname,
                                        ahttpclient=ahttpclient)
-                self.fn2astm[fn] = a
-                a.run_task()
-                w = SimpleSourceFileWorkLoader(fname, a)
-                hl = HashLoader(self, a, fn, w)
+
+                hl = HashLoader(self, a, fn)
+                await hl.load_db_hash(fn)
+
                 a.add_TaskLoader(hl)
+                dl = None
+
+                db_has_hash = await hl.db_hash_exists()
+                fast_hash = db_has_hash and self.can_load_opt
+                if not db_has_hash and fname.exists():
+                    fname.unlink()
+                    fast_hash = False
+
+                if not fast_hash:
+                    class DlLoader(TaskLoader):
+                        def __init__(self, me, source, fn):
+                            super().__init__(source)
+                            self.me = me
+                            self.fn = fn
+
+                        async def handle_source_eos(self, exc=None):
+                            await self.me.fn_wait(self.fn, download_done=True)
+                            exc = exc
+                            self._source.remove(self)
+
+                    dl = DlLoader(self, a, fn)
+                    a.add_TaskLoader(dl)
+                    dl.run_task()
+
+                self.fn2astm[fn] = a
+                can_load_opt = self.opt_hash
+                await self.fn_wait(fn, download=True,
+                                   fast_hash=fast_hash)
+                a.run_task()
                 tcloader = None
                 for tcn in (1, 2):
                     tcloader = self.get_transcode_loader(fn, tcn, a)
                     if tcloader is not None:
                         break
 
-                if (self.opt_hash and tcloader is not None and
+                if (can_load_opt and tcloader is not None and
                         not tcloader.is_running()):
-                    async with self._cond:
-                        self.tcfn[fn] = tcn
-                        self._cond.notify_all()
+                    await self.fn_wait(fn, pass1=True)
                     tcloader.run_task()
+                    async with self._cond:
+                        self.tcfn[fn] = ('pass', tcn)
+                        self._cond.notify_all()
                     a.add_TaskLoader(tcloader)
 
                 await hl.wait_for_hash()
-                if not hl.hash_match():
+                m = hl.hash_match()
+                if (m is None and fname.exists() or
+                        m is not None and not m):
                     if fname.exists():
-                        fname.unlink()
+                        await a.truncate_file()
                     if self.replace_hash_on_fail:
                         print(f"mismatch hash: {fn}. retry/replace")
-                        hl.reset_hash()
+                        hl.reset()
                         await hl.wait_for_hash()
                     if not hl.hash_match():
                         async with self._cond:
-                            self.tcfn[fn] = 'err'
+                            self.tcfn[fn] = ('err', 'dlhash')
                             self._cond.notify_all()
-                        raise ValueError(f"{fn}: Hash mismatch")
+                        return fn, self.tcfn[fn]
                 else:
-                    if (not self.opt_hash and tcloader is not None
+                    if (can_load_opt and tcloader is not None
                             and not tcloader.is_running()):
+                        await self.fn_wait(fn, pass1=True)
                         tcloader.run_task()
                         a.add_TaskLoader(tcloader)
+                if not tcloader._taskme.done():
+                    await tcloader._taskme
+                await self.fn_wait(fn, pass_done=True)
 
-                if tcn == 1 and tcloader is not None:
-                    tcn = 2
+                if (tcn == 1 and tcloader is not None and
+                        self.get_transcode_loader(fn, tcn + 1) is None):
+                    exc = tcloader.get_exception()
                     async with self._cond:
-                        self.tcfn[fn] = tcn
+                        if exc is None:
+                            self.tcfn[fn] = ('done', tcn)
+                        else:
+                            self.tcfn[fn] = ('err', tcn, exc)
                         self._cond.notify_all()
-                    tcloader = self.get_transcode_loader(fn, tcn)
-                    tcloader.run_task()
-                    a.add_TaskLoader(tcloader)
+                        return fn, self.tcfn[fn]
+                self.tcfn[fn] = ('wait4pass', tcn + 1)
+
+                tcn = 2
                 async with self._cond:
-                    self.tcfn[fn] = 'done'
+                    self.tcfn[fn] = ('pass', tcn)
                     self._cond.notify_all()
-                return  # Finished.
+                tcloader = self.get_transcode_loader(fn, tcn)
+                tcloader.run_task()
+                await self.fn_wait(fn, pass2=True)
+                a.add_TaskLoader(tcloader)
+                if not tcloader._taskme.done():
+                    await tcloader._taskme
+
+                await self.fn_wait(fn, pass_done=True)
+                exc = tcloader.get_exception()
+                async with self._cond:
+                    if exc is None:
+                        self.tcfn[fn] = ('done', tcn)
+                    else:
+                        self.tcfn[fn] = ('err', tcn, exc)
+                    self._cond.notify_all()
+                    return fn, self.tcfn[fn]
 
         finally:
             async with self._cond:
@@ -1931,8 +2023,10 @@ class OnlineConfigDbMgr:
         if not dbexists:
             await self.run_load(create_schema=not dbexists, block=True)
         tt = None
-        async with aiosqlite.connect(self._dbfn) as db:
+        async with aiosqlite.connect(
+                "file:/" + str(self._dbfn) + "?mode=ro", uri=True) as db:
             await setup_db_conn(db)
+            self._db = db
             if dbexists:
                 await self.run_load(create_schema=False, block=False)
             await self.load_obj(db)
