@@ -713,10 +713,10 @@ class TaskLoader:
             while self._is_running:
                 if self._source is not None:
                     self._read_from_file_gap_end = self._source._pos
-                if (self._source._afh is not None and
-                        self._read_from_file_gap_end is not None and
-                        self._queue.empty()):
-                    await self._fill_gap_from_file()
+                    if (self._source._afh is not None and
+                            self._read_from_file_gap_end is not None and
+                            self._queue.empty()):
+                        await self._fill_gap_from_file()
 
                 chunk_item = await self._queue.get()
                 if chunk_item[0] is None and chunk_item[1] is None:
@@ -866,6 +866,7 @@ class HashLoader(TaskLoader):
         self._cond = asyncio.Condition()
 
     def reset(self):
+        super().reset()
         self._hashstr = self._computed_hashstr = None
 
     async def wait_for_hash(self):
@@ -912,11 +913,9 @@ class HashLoader(TaskLoader):
     async def _send_chunk(self, chunk):
         #        self._pos += len(chunk)
         size = self._source.finished_size()
-        if size is not None and self._last_proc_chunk_end_pos >= size:
-            self.update_hash(chunk)
-            await self.finish_up()
-            return
         self.update_hash(chunk)
+        if size is not None and self._last_proc_chunk_end_pos >= size:
+            await self.finish_up()
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
@@ -1049,15 +1048,15 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                     continue
 
                 stdin = self._proc.stdin
-                if stdin is None:
-                    return None
+            if stdin is None:
+                return None
 
-                if chunk is not None:
-                    print("wrting in", self, len(chunk))
-                    stdin.write(chunk)
-                if await self._handle_source_eos_if_self_at_end(stdin):
-                    return None
-                break
+            if chunk is not None:
+                print("wrting in", self, len(chunk))
+                stdin.write(chunk)
+            if await self._handle_source_eos_if_self_at_end(stdin):
+                return None
+            break
 
         try:
             if chunk:
