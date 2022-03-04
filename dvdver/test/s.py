@@ -12,15 +12,15 @@ import traceback
 
 from PIL import ImageFont, ImageDraw, Image
 import aiofiles
-# from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
 import httpx
+
 from cfgmgr import CfgMgr
 
+
+# from aiofile import (AIOFile, LineReader, Writer, Reader)
 # https://stackoverflow.com/questions/64395127/how-do-i-write-a-async-decorator-that-restores-the-cwd
-
-
 class CoroWrapper:
     """Wrap ``target`` to have every send issued in a ``context``"""
 
@@ -689,15 +689,14 @@ class TaskLoader:
             start = pos
             chunk = await self._afh.read(512 * 1024)
             if not chunk:
-                return
-            m = memoryview(chunk)
-            m.toreadonly()
+                break
 
-            pos += m.nbytes
-            await self._proc_chunk(start, m)
+            pos += len(chunk)
+            await self._proc_chunk(start, chunk)
 
             if not self._queue.empty():
                 break
+        return
 
     async def handle_task_run_done(self):
         pass
@@ -1127,7 +1126,7 @@ class AsyncStreamTaskMgr:
             return
         start_pos = pos
         pos += len(chunk)
-        await f.write(chunk, offset=start_pos)
+        await f.write(chunk)
         for i in self._taskloaders:
             m = memoryview(chunk)
             m.toreadonly()
@@ -1152,16 +1151,21 @@ class AsyncStreamTaskMgr:
 
         if self._fname.exists() and not self._fname.is_file():
             raise FileNotFoundError("a non file is found")
-        with open(self._fname, 'ab+') as f:
-            f.seek(0, os.SEEK_END)
-            file_sz = f.tell()
-        filename = str(self._fname) if self._fname else ''
-
+        file_sz, filename = 0, ''
+        if self._fname is not None:
+            filename = self._fname
+        try:
+            p = Path(self._fname)
+            if p.exists():
+                filename = self._fname
+                file_sz = p.stat().st_size
+        except Exception as e:
+            print(e)
         firsttime = True
         resume_header = None
         pos = 0
         if filename != '':
-            f = await aiofiles.open(self._fname, 'rb+')
+            f = await aiofiles.open(str(self._fname), 'rb+')
         try:
             if filename != '':
                 self._afh = f
@@ -1223,6 +1227,8 @@ class AsyncStreamTaskMgr:
                         if web_file_sz == file_sz:
                             pos = file_sz
                         self._pos = pos
+                        await f.seek(pos, os.SEEK_SET)
+
                         async for chunk in resp.aiter_bytes():
                             pos = await self.proc_chunk(f, self._pos, chunk)
                             self._pos = pos
@@ -1341,6 +1347,7 @@ class OnlineConfigDbMgr:
         self.currentfns = set()
         self.dlcnt = 65536
         self.passcnt = 4
+        self.cross_process_files = True
 
     async def process_dvd_files(self, dvdnum):
         # run dvdauthor. Iso combine files.
@@ -1483,7 +1490,8 @@ class OnlineConfigDbMgr:
 
                 db_has_hash = await hl.db_hash_exists()
                 fast_hash = db_has_hash and self.can_load_opt
-                if not db_has_hash and fname.exists():
+                if (not db_has_hash and not self.cross_process_files
+                        and fname.exists()):
                     fname.unlink()
                     fast_hash = False
 
@@ -1508,6 +1516,10 @@ class OnlineConfigDbMgr:
                 await self.fn_wait(fn, download=True,
                                    fast_hash=fast_hash)
                 a.run_task()
+                # Sleep to make sure the a.run_task takes effect
+                # and runs the
+                # task.
+                await asyncio.sleep(0)
                 tcloader = None
                 for tcn in (1, 2):
                     tcloader = self.get_transcode_loader(fn, tcn, a)
@@ -1525,7 +1537,8 @@ class OnlineConfigDbMgr:
 
                 await hl.wait_for_hash()
                 m = hl.hash_match()
-                if (m is None and fname.exists() or
+                if (m is None and fname.exists()
+                    and not self.cross_process_files or
                         m is not None and not m):
                     if fname.exists():
                         await a.truncate_file()
