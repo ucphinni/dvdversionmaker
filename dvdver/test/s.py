@@ -1012,6 +1012,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         size = self._source.finished_size()
         if size is None:
             return False
+        print("Got finished size")
         assert self._last_proc_chunk_start_pos <= size
         ret = False
         if self._last_proc_chunk_start_pos == size:
@@ -1061,9 +1062,9 @@ class AsyncProcExecLoader(TaskLoader, ABC):
             if chunk:
                 await stdin.drain()
         except ConnectionResetError as e:
-            self.handle_source_eos(exc=e)
+            await self.handle_source_eos(exc=e)
         except BrokenPipeError as e:
-            self.handle_source_eos(exc=e)
+            await self.handle_source_eos(exc=e)
         return
 
 
@@ -1148,24 +1149,22 @@ class AsyncStreamTaskMgr:
                 assert False
         offline = url is None
         web_file_sz = None
+        try:
+            file_sz = Path(self._fname).stat().st_size
+        except FileNotFoundError:
+            file_sz = 0
 
         if self._fname.exists() and not self._fname.is_file():
             raise FileNotFoundError("a non file is found")
-        file_sz, filename = 0, ''
-        if self._fname is not None:
-            filename = self._fname
-        try:
-            p = Path(self._fname)
-            if p.exists():
-                filename = self._fname
-                file_sz = p.stat().st_size
-        except Exception as e:
-            print(e)
+
+        filename = str(self._fname) if self._fname else ''
+
         firsttime = True
         resume_header = None
         pos = 0
         if filename != '':
-            f = await aiofiles.open(str(self._fname), 'rb+')
+            f = await aiofiles.open(filename, mode='rb+')
+        print("start read")
         try:
             if filename != '':
                 self._afh = f
