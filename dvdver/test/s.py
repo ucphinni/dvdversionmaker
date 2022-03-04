@@ -1,4 +1,4 @@
-from abc import ABC, abstractmethod
+from abc import ABC
 import asyncio
 from collections import defaultdict
 from enum import IntEnum
@@ -825,7 +825,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         stdout = asyncio.subprocess.DEVNULL
         stderr = asyncio.subprocess.DEVNULL
         CREATE_NO_WINDOW = 0x08000000
-        DETACHED_PROCESS = 0x00000008
+        # DETACHED_PROCESS = 0x00000008
         try:
             if stdout_fname is not None:
                 stdout = open(stdout_fname, "w+")
@@ -990,7 +990,6 @@ class AsyncStreamTaskMgr:
 
     async def run(self) -> None:
         url = self._url
-
         if url and url.startswith("file://"):
             if self._fname is None:
                 print("filename does not exist")
@@ -1017,7 +1016,7 @@ class AsyncStreamTaskMgr:
         resume_header = None
         pos = 0
         if filename != '':
-            f = AIOFile(self._fname, 'rb+')
+            f = AIOFile(self._fname, 'wb+')
             await f.open()
         print("start read")
         try:
