@@ -19,60 +19,6 @@ import httpx
 from cfgmgr import CfgMgr
 
 
-# from aiofile import (AIOFile, LineReader, Writer, Reader)
-# https://stackoverflow.com/questions/64395127/how-do-i-write-a-async-decorator-that-restores-the-cwd
-class CoroWrapper:
-    """Wrap ``target`` to have every send issued in a ``context``"""
-
-    def __init__(self, target: 'Coroutine', context: 'ContextManager'):
-        self.target = target
-        self.context = context
-
-    # wrap an iterator for use with 'await'
-    def __await__(self):
-        # unwrap the underlying iterator
-        target_iter = self.target.__await__()
-        # emulate 'yield from'
-        iter_send, iter_throw = target_iter.send, target_iter.throw
-        send, message = iter_send, None
-        while True:
-            # communicate with the target coroutine
-            try:
-                with self.context:
-                    signal = send(message)
-            except StopIteration as err:
-                return err.value
-            else:
-                send = iter_send
-            # communicate with the ambient event loop
-            try:
-                message = yield signal
-            except BaseException as err:
-                send, message = iter_throw, err
-
-# copy CoroWrapper from https://stackoverflow.com/a/56079900/1600898
-
-
-class PreserveDir:
-    def __init__(self):
-        self.inner_dir = None
-
-    def __enter__(self):
-        self.outer_dir = os.getcwd()
-        if self.inner_dir is not None:
-            os.chdir(self.inner_dir)
-
-    def __exit__(self, *_):
-        self.inner_dir = os.getcwd()
-        os.chdir(self.outer_dir)
-
-
-def preserve_dir(fn):
-    async def wrapped(*args, **kwds):
-        return await CoroWrapper(fn(*args, **kwds), PreserveDir())
-    return wrapped
-
-
 def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
                     E_BR='500k', VBV_MBR='9800k', E_MIK=18,
                     E_DAR='16:9', E_SZ='720x480', E_FR='30000/1001',
@@ -694,7 +640,7 @@ class TaskLoader:
             pos += len(chunk)
             await self._proc_chunk(start, chunk)
 
-            if not self._queue.empty():
+            if not self._queue.empty() or self._force_terminate:
                 break
         return
 
@@ -716,11 +662,16 @@ class TaskLoader:
                             self._read_from_file_gap_end is not None and
                             self._queue.empty()):
                         await self._fill_gap_from_file()
-
+                if self._force_terminate:
+                    return
                 chunk_item = await self._queue.get()
+                if self._force_terminate:
+                    return
                 if chunk_item[0] is None and chunk_item[1] is None:
                     break
                 await self._proc_chunk(chunk_item[0], chunk_item[1])
+                if self._force_terminate:
+                    return
             fin_size = self._source.finished_size()
             assert fin_size is not None
             self._read_from_file_gap_end = self._last_proc_chunk_end_pos
@@ -965,26 +916,26 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 await self._cond.wait()
         return
 
-    @preserve_dir
     async def _start_cmd(
             self, stdout_fname=None, stderr_fname=None,
             cwd=None):
         pid, rc = None, None
         stdout = asyncio.subprocess.DEVNULL
         stderr = asyncio.subprocess.DEVNULL
-
+        CREATE_NO_WINDOW = 0x08000000
+        DETACHED_PROCESS = 0x00000008
         try:
             if stdout_fname is not None:
                 stdout = open(stdout_fname, "w+")
             if stderr_fname is not None:
                 stderr = open(stderr_fname, "w+")
-            if cwd is not None:
-                os.chdir(cwd)
             p = await asyncio.create_subprocess_exec(
                 *self._cmd_ary,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=stdout,
-                stderr=stderr
+                stderr=stderr,
+                creationflags=CREATE_NO_WINDOW,
+                cwd=cwd,
             )
             async with self._cond:
                 self._proc = p
@@ -1030,7 +981,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
 
     async def handle_source_eos(self, exc=None):
         await self._send_chunk(None)
-        exc = exc
+        if exc:
+            self._force_terminate = True
 
     async def _send_chunk(self, chunk):
         if chunk is None:
