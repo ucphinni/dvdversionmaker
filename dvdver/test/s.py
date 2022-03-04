@@ -11,7 +11,7 @@ import sys
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
-import aiofiles
+from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
 import aiosqlite
 import httpx
@@ -563,7 +563,7 @@ class TaskLoader:
         if (self._is_running and self._afh is not None):
             self.set_afh(self._afh)
 
-    def set_afh(self, afh):
+    def set_afh(self, afh: AIOFile):
         self._afh = afh
         if self._source is not None:
             pos = self._source._pos
@@ -630,10 +630,10 @@ class TaskLoader:
 
     async def _fill_gap_from_file(self):
         pos = self._last_proc_chunk_end_pos
-        await self._afh.seek(pos, os.SEEK_SET)
+        reader = Reader(self._afh, offset=pos, chunk_size=512 * 1024)
         while self._is_running:
             start = pos
-            chunk = await self._afh.read(512 * 1024)
+            chunk = await reader.read_chunk()
             if not chunk:
                 break
 
@@ -703,104 +703,6 @@ class TaskLoader:
                 return True
         except asyncio.QueueFull:
             return False
-
-
-class WorkMgr(ABC):
-    def __init__(self, source):
-        self._current_workmgr = self
-        self._done = False
-        self._tasks = set()
-        self._source = source
-        self._promote_opt = None
-        self._promoted = False
-        self._taskme = None
-
-    @abstractmethod
-    def next_WorkMgr(self):
-        pass
-
-    @abstractmethod
-    def add_WorkMgr(self, w: "WorkMgr") -> None:
-        pass
-
-    def add_TaskLoader(self, t: TaskLoader) -> None:
-        self._tasks.add(t)
-
-    async def replace_TaskLoader(
-            self, t: TaskLoader, r: TaskLoader) -> bool:
-        self._tasks.remove(t)
-        self._tasks.add(r)
-        r._loaders = t._loaders
-        t._loaders = []
-        if self._current_workmgr._promoted:
-            self._source.add_TaskLoader(r)
-            self._source.remove_TaskLoader(t)
-            r.run_task()
-            CfgMgr.cancel(t._taskme)
-            await asyncio.sleep(0)
-        return True
-
-    async def promote_optimistic(self) -> None:
-        self._current_workmgr._promote_opt = True
-        self._current_workmgr._promoted = True
-        for t in self._current_workmgr._tasks:
-            self._source.add_TaskLoader(t)
-            t.run_task()
-
-    async def demote(self, taskloaders, stop=True) -> None:
-        for t in taskloaders:
-            self._source.remove_TaskLoader(t)
-
-            if stop:
-                t.stop()
-
-    @abstractmethod
-    def any_work_done(self) -> bool:
-        return False
-
-    @abstractmethod
-    async def rollback(self) -> bool:
-        await self.demote(self._current_workmgr._tasks)
-
-        self._current_workmgr.cleanup()
-
-        return True
-
-    async def commit(self):
-        if not self._current_workmgr._promote_opt:
-            for t in self._current_workmgr._tasks:
-                self._source.add_TaskLoader(t)
-        oldts = self._current_workmgr._tasks
-        self._current_workmgr._tasks = set()
-        w = self.next_WorkMgr()
-        self._current_workmgr = w
-        if w is None:
-            self._done = True
-            await self.demote(oldts)
-            CfgMgr.cancel(self._taskme)
-            # await asyncio.sleep(0)
-            return
-
-        self.demote(
-            oldts.difference(self._current_workmgr._tasks),
-            stop=True)
-
-    def run_task(self):
-        async def run():
-            try:
-                await self.promote_optimistic()
-                while True:
-                    await asyncio.sleep(360)
-            except ValueError:
-                pass
-            else:
-                pass
-            finally:
-                self._taskme = None
-
-        if self._taskme is None:
-            self._taskme = CfgMgr.create_task(run())
-        return self._taskme
 
 
 class HashLoader(TaskLoader):
@@ -1079,7 +981,7 @@ class AsyncStreamTaskMgr:
             return
         start_pos = pos
         pos += len(chunk)
-        await f.write(chunk)
+        await f.write(chunk, offset=start_pos)
         for i in self._taskloaders:
             m = memoryview(chunk)
             m.toreadonly()
@@ -1115,7 +1017,8 @@ class AsyncStreamTaskMgr:
         resume_header = None
         pos = 0
         if filename != '':
-            f = await aiofiles.open(filename, mode='rb+')
+            f = AIOFile(self._fname, 'rb+')
+            await f.open()
         print("start read")
         try:
             if filename != '':
@@ -1165,8 +1068,10 @@ class AsyncStreamTaskMgr:
                                 f" {filename} for {url}")
                         if (resp_code == 200 and web_file_sz is not None
                                 and file_sz > 0):
-                            print(f"verify {web_file_sz} {file_sz}")
+                            print(f"bad size {web_file_sz} {file_sz}")
                             pos = 0
+                            await self.truncate_file()
+
                         elif resp_code == 206:
                             pos = file_sz
                         if resp_code == 416:
@@ -1178,8 +1083,6 @@ class AsyncStreamTaskMgr:
                         if web_file_sz == file_sz:
                             pos = file_sz
                         self._pos = pos
-                        await f.seek(pos, os.SEEK_SET)
-
                         async for chunk in resp.aiter_bytes():
                             pos = await self.proc_chunk(f, self._pos, chunk)
                             self._pos = pos
@@ -1753,8 +1656,8 @@ class OnlineConfigDbMgr:
             fn = Path(fn[7:])
             if not fn.is_absolute():
                 fn = CfgMgr.DLDIR / fn
-            async with aiofiles.open(fn, 'r', encoding="utf-8") as f:
-                await self._parse_streamed_lines(f, db)
+            async with AIOFile(fn, 'r', encoding="utf-8") as f:
+                await self._parse_streamed_lines(LineReader(f), db)
             return
         session = self._session
         while True:
@@ -1791,9 +1694,10 @@ class OnlineConfigDbMgr:
             )
 
             async def write_xmlrows2file(fn, rows):
-                async with aiofiles.open(fn, 'w') as f:
+                async with AIOFile(fn, 'w') as f:
+                    writer = Writer(f)
                     for tab, sstr in map(lambda r: (r['tab'], r['str']), rows):
-                        await f.write((' ' * (2 * tab)) + sstr + '\n')
+                        await writer((' ' * (2 * tab)) + sstr + '\n')
 
             # dvdary = []
             dvdfns = {}
