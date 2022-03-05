@@ -159,6 +159,9 @@ CREATE TABLE "localpath" (
 CREATE TABLE "hash_file" (
 	"fn"	TEXT NOT NULL,
 	"hashstr"	TEXT NOT NULL,
+	"pos"	INTEGER NOT NULL,
+	"done"	BOOLEAN NOT NULL
+	DEFAULT 0 CHECK("active" = 0 OR "active" = 1),
 	PRIMARY KEY("fn")
 );
 
@@ -827,8 +830,8 @@ delete from hash_file where fn = :fn;
 select * from hash_file where fn = :fn;
 
 -- name: replace_hash_fns*!
-replace into hash_file(fn,hashstr)
-VALUES(:fn,:hashstr);
+replace into hash_file(fn,hashstr,pos,done)
+VALUES(:fn,:hashstr,:pos,:done);
 
 -- name: get_dvdmainmenu
 -- this query has the property if the menubreak is removed,

@@ -3,11 +3,11 @@ import asyncio
 from collections import defaultdict
 from enum import IntEnum
 import hashlib
+import logging
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
-import sys
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
@@ -717,8 +717,7 @@ class HashLoader(TaskLoader):
         super().__init__(source)
         self._hashstr = None
         self._computed_hashstr = None
-#        self._pos = 0
-        self._finish_pos = None
+        self._pos = None
         self._fn = fn
         self._hashalgo = hashlib.blake2b()
         self._ocd = ocd
@@ -727,6 +726,10 @@ class HashLoader(TaskLoader):
     def reset(self):
         super().reset()
         self._hashstr = self._computed_hashstr = None
+
+    def bad_file(self, fn):
+        fn = fn
+        assert False
 
     async def wait_for_hash(self):
         async with self._cond:
@@ -750,31 +753,40 @@ class HashLoader(TaskLoader):
         async with self._cond:
             return self._hashstr is not None
 
-    async def finish_up(self):
-        if self._taskme is None:
-            return
-
-        ocd, fn = self._ocd, self._fn
-        self._source.remove_TaskLoader(self)
-        computed_hashstr = self._hashalgo.digest()
-
-        if self._hashstr is None:
-            await ocd.replace_hash_fn(computed_hashstr, fn)
-        async with self._cond:
-            self._computed_hashstr = computed_hashstr
-            self._cond.notify_all()
-
-        return
-
-    def update_hash(self, chunk) -> None:
-        self._hashalgo.update(chunk)
-
     async def _send_chunk(self, chunk):
         #        self._pos += len(chunk)
-        size = self._source.finished_size()
-        self.update_hash(chunk)
-        if size is not None and self._last_proc_chunk_end_pos >= size:
-            await self.finish_up()
+        try:
+            assert self._pos is not None
+            self.update_hash(chunk)
+            self._hashalgo.update(chunk)
+            pos = self._last_proc_chunk_end_pos
+            if pos < self._pos:
+                return
+            if (pos >= self._pos and
+                    self._last_proc_chunk_start_pos <= self._pos):
+                p1 = chunk[:self._pos - self._last_proc_chunk_start_pos]
+                self._hashalgo.update(p1)
+                computed_hashstr = self._hashalgo.digest()
+                if (self._hashstr != computed_hashstr):
+                    self.bad_file(self._fn)
+                chunk = chunk[self._pos - self._last_proc_chunk_start_pos:]
+            computed_hashstr = self._hashalgo.digest()
+            size = self._source.finished_size()
+            done = size is not None and pos == self._source.finished_size()
+            if pos > self._pos:
+                ocd, fn = self._ocd, self._fn
+                await ocd.replace_hash_fn(computed_hashstr, fn, pos, done)
+                self._pos = pos
+
+            if done:
+                self._source.remove_TaskLoader(self)
+                async with self._cond:
+                    if self._computed_hashstr != computed_hashstr:
+                        self._computed_hashstr = computed_hashstr
+                        self._cond.notify_all()
+            assert size is None or self._last_proc_chunk_end_pos <= size
+        except AssertionError:
+            logging.exception(self._fn)
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
@@ -803,17 +815,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         print("asyncprocexecloader run start", self._taskme)
         try:
             await super().run()
-        except AssertionError:
-            _, _, tb = sys.exc_info()
-            traceback.print_tb(tb)  # Fixed format
-            tb_info = traceback.extract_tb(tb)
-            filename, line, func, text = tb_info[-1]
-
-            print(f'An error occurred on {filename}:{line} {func}'
-                  f' in statement {text}'.format(line, text))
-            exit(1)
         except Exception:
-            print(traceback.format_exc())
+            logging.exception(self._cmd_ary)
             raise
         print("awaiting cmd task", self._taskme, cmd_task)
 
@@ -830,7 +833,6 @@ class AsyncProcExecLoader(TaskLoader, ABC):
     async def _start_cmd(
             self, stdout_fname=None, stderr_fname=None,
             cwd=None):
-        pid, rc = None, None
         stdout = asyncio.subprocess.DEVNULL
         stderr = asyncio.subprocess.DEVNULL
         CREATE_NO_WINDOW = 0x08000000
@@ -1065,7 +1067,7 @@ class AsyncStreamTaskMgr:
 
                 try:
                     if not firsttime and web_file_sz is None:
-                        resume_header = {'Range': 'bytes=%d-' % (file_sz - 1)}
+                        resume_header = {'Range': 'bytes=%d-' % (file_sz)}
                     elif not firsttime:
                         resume_header = {
                             'Range': 'bytes=%d-%d' % (file_sz, web_file_sz - 1)
@@ -1091,16 +1093,17 @@ class AsyncStreamTaskMgr:
                                 f"Bad code {resp_code} with" +
                                 f" {filename} for {url}")
                         if (resp_code == 200 and web_file_sz is not None
-                                and file_sz > 0):
+                                and file_sz > 0 and web_file_sz != file_sz):
                             print(f"bad size {web_file_sz} {file_sz}")
                             pos = 0
                             await self.truncate_file()
-
+                        elif (resp_code == 200 and web_file_sz is not None
+                              and file_sz == web_file_sz):
+                            break
                         elif resp_code == 206:
                             pos = file_sz
                         if resp_code == 416:
-                            print('416 Range: bytes=%d-%d' %
-                                  (file_sz, web_file_sz - 1))
+                            print('416 Range:', resume_header)
                             raise ValueError(
                                 f"Bad code {resp_code} with " +
                                 f"{filename} for {url}")
@@ -1448,7 +1451,7 @@ class OnlineConfigDbMgr:
                 await self.fn_wait(fn, pass_done=True)
 
                 if (tcn == 1 and tcloader is not None and
-                        self.get_transcode_loader(fn, tcn + 1) is None):
+                        self.get_transcode_loader(fn, tcn + 1, a) is None):
                     exc = tcloader.get_exception()
                     async with self._cond:
                         if exc is None:
@@ -1463,7 +1466,7 @@ class OnlineConfigDbMgr:
                 async with self._cond:
                     self.tcfn[fn] = ('pass', tcn)
                     self._cond.notify_all()
-                tcloader = self.get_transcode_loader(fn, tcn)
+                tcloader = self.get_transcode_loader(fn, tcn, a)
                 tcloader.run_task()
                 await self.fn_wait(fn, pass2=True)
                 a.add_TaskLoader(tcloader)
@@ -1496,10 +1499,11 @@ class OnlineConfigDbMgr:
         r = await queries.get_file_hash(db, fn=fn)
         return r[0]['hashstr'] if r is not None and len(r) > 0 else None
 
-    async def replace_hash_fn(self, hashstr, fn):
+    async def replace_hash_fn(self, hashstr, fn, pos, done):
         await self.run_bg_task()
         async with self._cond:
-            self._hash_fn_queue.append({'fn': fn, 'hashstr': hashstr})
+            self._hash_fn_queue.append(
+                {'fn': fn, 'hashstr': hashstr, 'pos': pos, 'done': done})
             self._cond.notify_all()
 
     async def add_menubreak_rows(self, ary):
@@ -1574,8 +1578,8 @@ class OnlineConfigDbMgr:
                 print(traceback.format_exc())
                 await db.rollback()
                 break
-            else:
-                print("except else")
+            except Exception:
+                logging.exception()
                 await db.rollback()
                 continue
 
@@ -1622,7 +1626,7 @@ class OnlineConfigDbMgr:
                             self._cond.notify_all()
                     await db.commit()
                 except Exception:
-                    print(traceback.format_exc())
+                    logging.exception()
                     await db.rollback()
                     continue
 
@@ -1864,8 +1868,9 @@ class OnlineConfigDbMgr:
             print("wait for spumux menu mpg")
             try:
                 await asyncio.gather(*fftasks)
-            except AssertionError:
-                traceback.print_exc()
+            except Exception:
+                logging.exception(self._cmd_ary)
+
             print("done spumux menu mpg")
         finally:
             for f in files:
