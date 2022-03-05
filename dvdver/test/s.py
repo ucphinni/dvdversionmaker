@@ -815,9 +815,11 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         except Exception:
             print(traceback.format_exc())
             raise
-        print("awaiting cmd task", self._taskme)
-        await cmd_task
-        print("asyncprocexecloader run done", self._taskme)
+        print("awaiting cmd task", self._taskme, cmd_task)
+
+        rc = await cmd_task
+        print("asyncprocexecloader run done",
+              self._taskme, cmd_task, rc)
 
     async def _wait_for_cmd_done(self):
         async with self._cond:
@@ -833,6 +835,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         stderr = asyncio.subprocess.DEVNULL
         CREATE_NO_WINDOW = 0x08000000
         # DETACHED_PROCESS = 0x00000008
+        rc = None
         try:
             if stdout_fname is not None:
                 stdout = open(stdout_fname, "w+")
@@ -851,11 +854,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 self._cond.notify_all()
                 proc = self._proc
             rc = await proc.wait()
-            print("process done!!!", rc)
-            async with self._cond:
-                self._process_terminated = True
-                await self._cond.notify_all()
-            pid = proc.pid
+            print("process done!!!")
         except OSError as e:
             return e
         finally:
@@ -863,8 +862,10 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 stdout.close()
             if stderr != asyncio.subprocess.DEVNULL:
                 stderr.close()
+            self._process_terminated = True
+
             print("proc done", self._taskme)
-        return pid, rc
+        return rc
 
     async def _handle_source_eos_if_self_at_end(self, stdin):
         if self._process_terminated:
@@ -1055,7 +1056,6 @@ class AsyncStreamTaskMgr:
                 resp = None
                 if web_file_sz is not None and web_file_sz == file_sz:
                     break
-
                 async with self._cond:
                     while not self._request_download:
                         await self._cond.wait()
@@ -1065,7 +1065,7 @@ class AsyncStreamTaskMgr:
 
                 try:
                     if not firsttime and web_file_sz is None:
-                        resume_header = {'Range': 'bytes=%d-' % (file_sz)}
+                        resume_header = {'Range': 'bytes=%d-' % (file_sz - 1)}
                     elif not firsttime:
                         resume_header = {
                             'Range': 'bytes=%d-%d' % (file_sz, web_file_sz - 1)
@@ -1107,9 +1107,16 @@ class AsyncStreamTaskMgr:
                         if web_file_sz == file_sz:
                             pos = file_sz
                         self._pos = pos
+                        request_download = None
                         async for chunk in resp.aiter_bytes():
                             pos = await self.proc_chunk(f, self._pos, chunk)
                             self._pos = pos
+                            async with self._cond:
+                                request_download = self._request_download
+                            if not request_download:
+                                break
+                        if not request_download:
+                            continue
                         break
                 except httpx.ConnectTimeout:
                     await asyncio.sleep(1)
