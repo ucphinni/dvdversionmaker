@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
@@ -718,9 +719,10 @@ class HashLoader(TaskLoader):
         self._hashstr = None
         self._computed_hashstr = None
         self._pos = None
+        self._done = None
+        self._ocd = ocd
         self._fn = fn
         self._hashalgo = hashlib.blake2b()
-        self._ocd = ocd
         self._cond = asyncio.Condition()
 
     def reset(self):
@@ -746,8 +748,24 @@ class HashLoader(TaskLoader):
         self.add_chunk(None, None)
 
     async def load_db_hash(self, fn):
-        async with self._cond:
-            self._hashstr = await ocd.get_file_hash(fn)
+        try:
+            hashstr, pos, done = None, 0, False
+            with sqlite3.connect(CfgMgr.DLDIR / 'dl.db') as db:
+                db.row_factory = aiosqlite.Row
+                cur = db.execute(
+                    "select * from hash_file where fn = ?", (fn,))
+                r = cur.fetchone()
+                if r is not None:
+                    hashstr, pos, done = r['hashstr'], r['pos'], r['done']
+            async with self._cond:
+                self._hashstr = hashstr
+                self._pos = pos
+                self._done = done
+                self._cond.notify_all()
+
+        except Exception:
+            logging.exception(self._hashstr, self.pos, self._done)
+            raise
 
     async def db_hash_exists(self):
         async with self._cond:
@@ -757,7 +775,6 @@ class HashLoader(TaskLoader):
         #        self._pos += len(chunk)
         try:
             assert self._pos is not None
-            self.update_hash(chunk)
             self._hashalgo.update(chunk)
             pos = self._last_proc_chunk_end_pos
             if pos < self._pos:
@@ -767,13 +784,14 @@ class HashLoader(TaskLoader):
                 p1 = chunk[:self._pos - self._last_proc_chunk_start_pos]
                 self._hashalgo.update(p1)
                 computed_hashstr = self._hashalgo.digest()
-                if (self._hashstr != computed_hashstr):
+                if (self._pos and self._hashstr is not None and
+                        self._hashstr != computed_hashstr):
                     self.bad_file(self._fn)
                 chunk = chunk[self._pos - self._last_proc_chunk_start_pos:]
             computed_hashstr = self._hashalgo.digest()
             size = self._source.finished_size()
             done = size is not None and pos == self._source.finished_size()
-            if pos > self._pos:
+            if pos >= self._pos:
                 ocd, fn = self._ocd, self._fn
                 await ocd.replace_hash_fn(computed_hashstr, fn, pos, done)
                 self._pos = pos
@@ -781,12 +799,12 @@ class HashLoader(TaskLoader):
             if done:
                 self._source.remove_TaskLoader(self)
                 async with self._cond:
-                    if self._computed_hashstr != computed_hashstr:
-                        self._computed_hashstr = computed_hashstr
-                        self._cond.notify_all()
+                    self._computed_hashstr = computed_hashstr
+                    self._cond.notify_all()
             assert size is None or self._last_proc_chunk_end_pos <= size
         except AssertionError:
             logging.exception(self._fn)
+        return
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
@@ -1404,11 +1422,11 @@ class OnlineConfigDbMgr:
                 await self.fn_wait(fn, download=True,
                                    fast_hash=fast_hash)
                 await a.start_download()
+                hl.run_task
                 a.run_task()
                 # Sleep to make sure the a.run_task takes effect
                 # and runs the
                 # task.
-                await asyncio.sleep(0)
                 tcloader = None
                 for tcn in (1, 2):
                     tcloader = self.get_transcode_loader(fn, tcn, a)
@@ -1423,8 +1441,10 @@ class OnlineConfigDbMgr:
                         self.tcfn[fn] = ('pass', tcn)
                         self._cond.notify_all()
                     a.add_TaskLoader(tcloader)
-
+                print(hl, "wait for hash")
+                hl.run_task()  # If not running already.
                 await hl.wait_for_hash()
+                print(hl, "finished hash wait")
                 m = hl.hash_match()
                 if (m is None and fname.exists()
                     and not self.cross_process_files or
@@ -1488,22 +1508,24 @@ class OnlineConfigDbMgr:
                 # Dont have to notify here. Save on signally.
                 self.currentfns.remove(fn)
 
-    def create_tc_task(
-            self,  dvdnum, fn, url, cmp, ahttpclient):
-        return asyncio.create_task(
-            self.file_task(
-                dvdnum, fn, url, ahttpclient, cmp))
-
     async def get_file_hash(self, fn):
         queries, db = self._queries, self._db
         r = await queries.get_file_hash(db, fn=fn)
-        return r[0]['hashstr'] if r is not None and len(r) > 0 else None
+        if r is None:
+            return None, None
+        return r[0]['hashstr'], r[0]['pos'], r[0]['done']
 
     async def replace_hash_fn(self, hashstr, fn, pos, done):
         await self.run_bg_task()
+        h = {'fn': fn, 'hashstr': hashstr, 'pos': pos, 'done': done}
         async with self._cond:
-            self._hash_fn_queue.append(
-                {'fn': fn, 'hashstr': hashstr, 'pos': pos, 'done': done})
+            for i, item in enumerate(self._hash_fn_queue):
+                if item['fn'] == fn:
+                    self._hash_fn_queue[i] = h
+                    h = None
+                    break
+            if h is not None:
+                self._hash_fn_queue.append(h)
             self._cond.notify_all()
 
     async def add_menubreak_rows(self, ary):
@@ -1558,6 +1580,7 @@ class OnlineConfigDbMgr:
                      'TRANSCODEDIR': str(CfgMgr.TRANSCODEDIR) + os.path.sep,
                      'PATHSEP': os.path.sep,
                      }
+                await queries.get_file_hash(db, fn="test")
                 await queries.add_local_paths(
                     db,
                     map(lambda x: {'key': x, 'dir': str(h[x])},
@@ -1586,21 +1609,25 @@ class OnlineConfigDbMgr:
     async def _run_bg_task(self):
         async with aiosqlite.connect(self._dbfn) as db:
             await setup_db_conn(db)
+            last_hash_time = None
             while True:
                 async with self._cond:
                     while True:
-                        hash_fn_ary = self._hash_fn_queue
-                        if len(self._hash_fn_queue):
-                            self._hash_fn_queue = []
                         menubreak_ary = self._menubreak_ary
                         run_load_args = self._run_load_args
                         if menubreak_ary is not None:
                             break
                         if run_load_args is not None:
                             break
-                        if len(hash_fn_ary):
-                            break
-                        await self._cond.wait()
+                        hash_fn_ary = None
+                        if len(self._hash_fn_queue):
+                            if (last_hash_time is None or
+                                    last_hash_time != time.time() // 5):
+                                last_hash_time = time.time() // 5
+                                hash_fn_ary = self._hash_fn_queue
+                                self._hash_fn_queue = []
+                                break
+                        await asyncio.wait_for(self._cond.wait(), timeout=1)
                 try:
                     queries = self._queries
                     await db.execute("BEGIN TRANSACTION")
@@ -1611,10 +1638,8 @@ class OnlineConfigDbMgr:
                             self._run_load_args = None
                             self._cond.notify_all()
                     if hash_fn_ary is not None:
-                        print("do hash")
                         await self.do_replace_hash_fns(
                             queries, db, hash_fn_ary)
-                        print("done hash")
                     if menubreak_ary is not None:
                         print("do menu")
                         await self.do_delete_all_menubreaks(
@@ -1885,7 +1910,8 @@ class OnlineConfigDbMgr:
             await self._bgmpg_task
             self._bgmpg_task = None
 
-    async def load_obj(self, db):
+    async def load_obj(self):
+        db = self._db
         queries = self._queries
         ary = await queries.get_filenames(db)
         fns = set()
@@ -1895,9 +1921,10 @@ class OnlineConfigDbMgr:
                                     r['dl_link'], r['cmp'])
             if cmp == 0:
                 self.currentfns.add(fn)
+            t = asyncio.create_task(
+                self.file_task(
+                    dvdnum, fn, url, self._session, cmp))
 
-            t = self.create_tc_task(
-                dvdnum, fn, url, cmp, self._session)
             fns.add(fn)
             fnst.add(t)
 
@@ -1927,20 +1954,19 @@ class OnlineConfigDbMgr:
         if not dbexists:
             await self.run_load(create_schema=not dbexists, block=True)
         tt = None
-        async with aiosqlite.connect(
-                "file:/" + str(self._dbfn) + "?mode=ro", uri=True) as db:
+        async with aiosqlite.connect(str(self._dbfn)) as db:
             await setup_db_conn(db)
             self._db = db
             if dbexists:
                 await self.run_load(create_schema=False, block=False)
-            await self.load_obj(db)
+            await self.load_obj()
             if tt is not None:
                 await tt
                 await self.load_obj(db)
 
 
 async def setup_db_conn(conn):
-    # await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA foreign_keys=ON")
     await conn.execute("PRAGMA read_uncommitted=ON")
     conn.row_factory = aiosqlite.Row

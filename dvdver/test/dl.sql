@@ -161,7 +161,7 @@ CREATE TABLE "hash_file" (
 	"hashstr"	TEXT NOT NULL,
 	"pos"	INTEGER NOT NULL,
 	"done"	BOOLEAN NOT NULL
-	DEFAULT 0 CHECK("active" = 0 OR "active" = 1),
+	DEFAULT 0 CHECK("done" = 0 OR "done" = 1),
 	PRIMARY KEY("fn")
 );
 
