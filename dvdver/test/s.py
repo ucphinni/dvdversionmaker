@@ -520,7 +520,7 @@ class TaskLoader:
 
     def run_task(self):
         if self._taskme is None:
-            self._taskme = CfgMgr.create_task(self.run())
+            self._taskme = asyncio.create_task(self.run())
         return self
 
     async def finish(self, done_file_sz, force=False):
@@ -598,11 +598,11 @@ class TaskLoader:
             #       PE----->PE)
             #       WS       WE
             # State: Can use but some possible chunk trimming work
-            await self._send_chunk(chunk[PE - WS:])
             async with self._cond:
                 self._last_proc_chunk_start_pos = PE
                 self._last_proc_chunk_end_pos = WE
                 self._cond.notify_all()
+            await self._send_chunk(chunk[PE - WS:])
             if GE is not None and GE <= WE:
                 #               WE
                 #     <---------GE   (If Gap end exists in range, clear it)
@@ -624,6 +624,7 @@ class TaskLoader:
 
     def stop(self):
         self._is_running = False
+        self._queue.put_nowait((None, None))
 
     def is_running(self):
         return self._is_running
@@ -662,9 +663,15 @@ class TaskLoader:
                             self._read_from_file_gap_end is not None and
                             self._queue.empty()):
                         await self._fill_gap_from_file()
+
                 if self._force_terminate:
                     return
+
+                if not self._is_running:
+                    break
+
                 chunk_item = await self._queue.get()
+
                 if self._force_terminate:
                     return
                 if chunk_item[0] is None and chunk_item[1] is None:
@@ -789,7 +796,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         if self._is_running_apel:
             return
         self._is_running_apel = True
-        cmd_task = CfgMgr.create_task(self._start_cmd(
+        cmd_task = asyncio.create_task(self._start_cmd(
             stdout_fname=self._stdout_fname,
             stderr_fname=self._stderr_fname,
             cwd=self._cwd))
@@ -865,21 +872,16 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         size = self._source.finished_size()
         if size is None:
             return False
-        print("Got finished size")
-        assert self._last_proc_chunk_start_pos <= size
-        ret = False
-        if self._last_proc_chunk_start_pos == size:
+        async with self._cond:
+            PE = self._last_proc_chunk_end_pos
+
+        assert PE <= size
+        print("Got finished size", PE, size)
+
+        if PE == size:
             self._process_terminated = True
             stdin.write_eof()
-            stdin.close()
-            await stdin.wait_closed()
-            ret = True
-
-        if not self._process_terminating:
-            self._process_terminating = True
-            self.add_chunk(None, None)
-            return ret
-        return ret
+            self.stop()
 
     async def handle_source_eos(self, exc=None):
         await self._send_chunk(None)
@@ -906,7 +908,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
                 return None
 
             if chunk is not None:
-                print("wrting in", self, len(chunk))
+                #    print("wrting in", self, len(chunk),
+                #          self._last_proc_chunk_start_pos)
                 stdin.write(chunk)
             if await self._handle_source_eos_if_self_at_end(stdin):
                 return None
@@ -924,7 +927,8 @@ class AsyncProcExecLoader(TaskLoader, ABC):
 
 class AsyncStreamTaskMgr:
     __slots__ = ('_afh', '_ahttpclient', '_taskloaders', '_url', '_fname',
-                 '_taskme', '_pos', '_taskme', '_running')
+                 '_taskme', '_pos', '_taskme', '_running',
+                 '_cond', '_request_download', '_download')
 
     def __init__(self, url: str = None, fname: Path = None,
                  ahttpclient: httpx.AsyncClient = None):
@@ -936,6 +940,23 @@ class AsyncStreamTaskMgr:
         self._pos = None
         self._running = False
         self._taskme = None
+        self._request_download = False
+        self._download = False
+        self._cond = asyncio.Condition()
+
+    async def start_download(self):
+        async with self._cond:
+            self._request_download = True
+            while self._download != self._request_download:
+                self._cond.notify_all()
+                await self._cond.wait()
+
+    async def stop_download(self):
+        async with self._cond:
+            self._request_download = False
+            while self._download != self._request_download:
+                self._cond.notify_all()
+                await self._cond.wait()
 
     async def truncate_file(self):
         self._pos = 0
@@ -946,13 +967,9 @@ class AsyncStreamTaskMgr:
     def is_offline(self):
         return self._url is None or self._afh is None
 
-    def cancel(self):
-        if self._taskme is not None:
-            CfgMgr.cancel(self._taskme)
-
     def run_task(self):
         if self._taskme is None:
-            self._taskme = CfgMgr.create_task(self.run())
+            self._taskme = asyncio.create_task(self.run())
         return self
 
     async def wait_for_started(self):
@@ -1016,7 +1033,7 @@ class AsyncStreamTaskMgr:
         resume_header = None
         pos = 0
         if filename != '':
-            f = AIOFile(self._fname, 'wb+')
+            f = AIOFile(self._fname, 'ab+')
             await f.open()
         print("start read")
         try:
@@ -1037,7 +1054,15 @@ class AsyncStreamTaskMgr:
 
                 resp = None
                 if web_file_sz is not None and web_file_sz == file_sz:
-                    break  # You are done.
+                    break
+
+                async with self._cond:
+                    while not self._request_download:
+                        await self._cond.wait()
+                    if self._download != self._request_download:
+                        self._download = self._request_download
+                        self._cond.notify_all()
+
                 try:
                     if not firsttime and web_file_sz is None:
                         resume_header = {'Range': 'bytes=%d-' % (file_sz)}
@@ -1198,7 +1223,7 @@ class OnlineConfigDbMgr:
         self.tcfn = {}
         self.dvd_tasks = {}
         self.currentfns = set()
-        self.dlcnt = 65536
+        self.dlcnt = 6
         self.passcnt = 4
         self.cross_process_files = True
 
@@ -1358,7 +1383,7 @@ class OnlineConfigDbMgr:
                         async def handle_source_eos(self, exc=None):
                             await self.me.fn_wait(self.fn, download_done=True)
                             exc = exc
-                            self._source.remove(self)
+                            self._source.remove_TaskLoader(self)
 
                     dl = DlLoader(self, a, fn)
                     a.add_TaskLoader(dl)
@@ -1368,6 +1393,7 @@ class OnlineConfigDbMgr:
                 can_load_opt = self.opt_hash
                 await self.fn_wait(fn, download=True,
                                    fast_hash=fast_hash)
+                await a.start_download()
                 a.run_task()
                 # Sleep to make sure the a.run_task takes effect
                 # and runs the
@@ -1716,17 +1742,17 @@ class OnlineConfigDbMgr:
                 sifn = fn = CfgMgr.MENUDIR / row['sifn']
                 if not fn.is_file() and fn not in selfn:
                     selfn.add(fn)
-                    fftasks.append(CfgMgr.create_task(
+                    fftasks.append(asyncio.create_task(
                         create_mensel(fn, 'sifn')))
                 ssfn = fn = CfgMgr.MENUDIR / row['ssfn']
                 if not fn.is_file() and fn not in selfn:
                     selfn.add(fn)
-                    fftasks.append(CfgMgr.create_task(
+                    fftasks.append(asyncio.create_task(
                         create_mensel(fn, 'ssfn')))
                 shfn = fn = CfgMgr.MENUDIR / row['shfn']
                 if not fn.is_file() and fn not in selfn:
                     selfn.add(fn)
-                    fftasks.append(CfgMgr.create_task(
+                    fftasks.append(asyncio.create_task(
                         create_mensel(fn, 'shfn')))
                 if dvdnum not in menusels:
                     menusels[dvdnum] = MenuSelector(sifn, shfn, ssfn)
