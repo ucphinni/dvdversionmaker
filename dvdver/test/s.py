@@ -794,7 +794,8 @@ class HashLoader(TaskLoader):
             done = size is not None and pos == self._source.finished_size()
             if pos >= self._pos:
                 ocd, fn = self._ocd, self._fn
-                await ocd.replace_hash_fn(computed_hashstr, fn, self._ftype, pos, done)
+                await ocd.replace_hash_fn(
+                    computed_hashstr, fn, self._ftype, pos, done)
                 self._pos = pos
 
             if done:
