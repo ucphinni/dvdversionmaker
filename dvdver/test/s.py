@@ -1242,6 +1242,7 @@ class OnlineConfigDbMgr:
         self._finishq = asyncio.Queue()
         self._run_load_args = None
         self._hash_fn_queue = []
+        self._fn_p1_ary = []
         self._bg_task = None
         self._menubreak_ary = None
         self.fn2astm = {}
@@ -1315,24 +1316,17 @@ class OnlineConfigDbMgr:
         finally:
             del self.dvd_tasks[dvdnum]
 
-    async def fn_wait(self, fn, start=False, download=False,
-                      pass1=False, pass2=False, download_done=False,
-                      pass_done=False, fast_hash=False):
+    async def fn_wait(
+            self, fn, download=False,
+            pass1=False, pass2=False, download_done=False,
+            pass_done=False,  exc=None):
         async with self._cond:
             '''
             If you are not the current fn, then delay your excution until
             the current is done for all dvdnums
             '''
-            if start:
-                if fn not in self.currentfns:
-                    while next(
-                        filter(lambda x: x in self.currentfns and
-                               not(self.tcfn[x][0] == "done"
-                                   or self.tcfn[x][0] == "err"),
-                               self.currentfns), False):
-                        await self._cond.wait()
             if download:
-                while (self.dlcnt <= 0 and not fast_hash) or (
+                while self.dlcnt <= 0 or (
                     fn not in self.currentfns and next(
                         filter(lambda x, self=self:
                                x not in self.tcfn or
@@ -1340,13 +1334,20 @@ class OnlineConfigDbMgr:
                                    "pass", "wait4pass", "done", "err"],
                                self.currentfns), '') != ''):
                     await self._cond.wait()
-                if not fast_hash:  # fast hash does not count.
-                    self.dlcnt -= 1
+                self.dlcnt -= 1
             if download_done:
-                assert not fast_hash
                 self.dlcnt += 1
+                if exc is None:
+                    self.tcfn[fn] = ('done', 'download')
+                else:
+                    self.tcfn[fn] = ('err', 'download', exc)
+
                 self._cond.notify_all()
-            if pass1 or pass2:
+            if not pass_done and (pass1 or pass2):
+                if pass2:
+                    self.tcfn[fn] = ('waitpass')
+                    self._cond.notify_all()
+
                 while self.passcnt <= 0 or (fn not in self.currentfns and next(
                     filter(lambda x, self=self:
                            x not in self.tcfn or
@@ -1354,10 +1355,94 @@ class OnlineConfigDbMgr:
                                "done", "err"],
                            self.currentfns), '') != ''):
                     await self._cond.wait()
+                if pass1:
+                    self.tcfn[fn] = ('pass', 1)
+                if pass2:
+                    self.tcfn[fn] = ('pass', 2)
                 self.passcnt -= 1
+                self._cond.notify_all()
             if pass_done:
+                if pass1:
+                    tcn = 1
+                if pass2:
+                    tcn = 2
                 self.passcnt += 1
                 self._cond.notify_all()
+                if exc is None:
+                    self.tcfn[fn] = ('done', tcn)
+                else:
+                    self.tcfn[fn] = ('err', tcn, exc)
+                self._cond.notify_all()
+
+    async def hash_task(self, fn, new_fn=False):
+        await self.fn_wait(fn, hash=True)
+        try:
+            a = self.fn2astm[fn]
+            hl = HashLoader(self, a, fn)
+            await hl.load_db_hash(fn)
+            a.add_TaskLoader(hl)
+
+            db_has_hash = await hl.db_hash_exists()
+            if (not db_has_hash and not self.cross_process_files
+                    and not new_fn):
+                assert False
+            hl.run_task()
+            await hl.wait_for_hash()
+            m = hl.hash_match()
+            if m:
+                return
+            if m is None:
+                if not (
+                        self.pass_dirty(fn, 1)
+                        or self.pass_dirty(fn, 2)):
+                    return
+            await a.reset(clear=True)
+        except Exception:
+            logging.exception()
+        finally:
+            await self.fn_wait(fn, hash_done=True)
+
+    async def pass_task(self, fn):
+        a = self.fn2astm[fn]
+
+        await self.fn_wait(fn, pass1=True)
+        tcloader = self.get_transcode_loader(fn, 1, a)
+        a.add_TaskLoader(tcloader)
+        try:
+            tcloader.run_task()
+            await tcloader._taskme
+        except asyncio.exceptions.CancelledError:
+            await tcloader.reset(clear=True)
+            tcloader.cancel()
+        except Exception:
+            logging.exception()
+        finally:
+            a.remove_TaskLoader(tcloader)
+            await self.fn_wait(
+                fn, pass_done=True, pass1=True,
+                exc=tcloader.get_exception())
+        try:
+            await self.fn_wait(fn, pass2=True)
+        except asyncio.exceptions.CancelledError:
+            tcloader.reset(clear=True)
+        except Exception:
+            logging.exception()
+
+        tcloader = self.get_transcode_loader(fn, 2, a)
+        a.add_TaskLoader(tcloader)
+        try:
+            tcloader.run_task()
+            await tcloader._taskme
+        except asyncio.exceptions.CancelledError:
+            await tcloader.reset(clear=True)
+            tcloader.cancel()
+        except Exception:
+            logging.exception()
+        finally:
+            a.remove_TaskLoader(tcloader)
+            await self.fn_wait(
+                fn, pass_done=True, pass2=True,
+                exc=tcloader.get_exception())
 
     async def file_task(self, dvdnum, fn, url, ahttpclient, cmp):
         try:
@@ -1388,139 +1473,58 @@ class OnlineConfigDbMgr:
                 a = AsyncStreamTaskMgr(url=url, fname=fname,
                                        ahttpclient=ahttpclient)
 
-                hl = HashLoader(self, a, fn)
-                await hl.load_db_hash(fn)
+                class DlLoader(TaskLoader):
+                    def __init__(self, me, source, fn):
+                        super().__init__(source)
+                        self.me = me
+                        self.fn = fn
 
-                a.add_TaskLoader(hl)
-                dl = None
+                    async def handle_source_eos(self, exc=None):
+                        await self.me.fn_wait(
+                            self.fn, download_done=True,
+                            exc=exc)
+                        self._source.remove_TaskLoader(self)
 
-                db_has_hash = await hl.db_hash_exists()
-                fast_hash = db_has_hash and self.can_load_opt
-                if (not db_has_hash and not self.cross_process_files
-                        and fname.exists()):
-                    fname.unlink()
-                    fast_hash = False
-
-                if not fast_hash:
-                    class DlLoader(TaskLoader):
-                        def __init__(self, me, source, fn):
-                            super().__init__(source)
-                            self.me = me
-                            self.fn = fn
-
-                        async def handle_source_eos(self, exc=None):
-                            await self.me.fn_wait(self.fn, download_done=True)
-                            exc = exc
-                            self._source.remove_TaskLoader(self)
-
-                    dl = DlLoader(self, a, fn)
-                    a.add_TaskLoader(dl)
-                    dl.run_task()
+                dl = DlLoader(self, a, fn)
+                a.add_TaskLoader(dl)
+                dl.run_task()
 
                 self.fn2astm[fn] = a
-                can_load_opt = self.opt_hash
-                await self.fn_wait(fn, download=True,
-                                   fast_hash=fast_hash)
-                await a.start_download()
-                hl.run_task
+                new_fn = not a.file_exists()
                 a.run_task()
-                # Sleep to make sure the a.run_task takes effect
-                # and runs the
-                # task.
-                tcloader = None
-                for tcn in (1, 2):
-                    tcloader = self.get_transcode_loader(fn, tcn, a)
-                    if tcloader is not None:
-                        break
-
-                if (can_load_opt and tcloader is not None and
-                        not tcloader.is_running()):
-                    await self.fn_wait(fn, pass1=True)
-                    tcloader.run_task()
-                    async with self._cond:
-                        self.tcfn[fn] = ('pass', tcn)
-                        self._cond.notify_all()
-                    a.add_TaskLoader(tcloader)
-                print(hl, "wait for hash")
-                hl.run_task()  # If not running already.
-                await hl.wait_for_hash()
-                print(hl, "finished hash wait")
-                m = hl.hash_match()
-                if (m is None and fname.exists()
-                    and not self.cross_process_files or
-                        m is not None and not m):
-                    if fname.exists():
-                        await a.truncate_file()
-                    if self.replace_hash_on_fail:
-                        print(f"mismatch hash: {fn}. retry/replace")
-                        hl.reset()
-                        await hl.wait_for_hash()
-                    if not hl.hash_match():
-                        async with self._cond:
-                            self.tcfn[fn] = ('err', 'dlhash')
-                            self._cond.notify_all()
-                        return fn, self.tcfn[fn]
-                else:
-                    if (can_load_opt and tcloader is not None
-                            and not tcloader.is_running()):
-                        await self.fn_wait(fn, pass1=True)
-                        tcloader.run_task()
-                        a.add_TaskLoader(tcloader)
-                if not tcloader._taskme.done():
-                    await tcloader._taskme
-                await self.fn_wait(fn, pass_done=True)
-
-                if (tcn == 1 and tcloader is not None and
-                        self.get_transcode_loader(fn, tcn + 1, a) is None):
-                    exc = tcloader.get_exception()
-                    async with self._cond:
-                        if exc is None:
-                            self.tcfn[fn] = ('done', tcn)
-                        else:
-                            self.tcfn[fn] = ('err', tcn, exc)
-                        self._cond.notify_all()
-                        return fn, self.tcfn[fn]
-                self.tcfn[fn] = ('wait4pass', tcn + 1)
-
-                tcn = 2
-                async with self._cond:
-                    self.tcfn[fn] = ('pass', tcn)
-                    self._cond.notify_all()
-                tcloader = self.get_transcode_loader(fn, tcn, a)
-                tcloader.run_task()
-                await self.fn_wait(fn, pass2=True)
-                a.add_TaskLoader(tcloader)
-                if not tcloader._taskme.done():
-                    await tcloader._taskme
-
-                await self.fn_wait(fn, pass_done=True)
-                exc = tcloader.get_exception()
-                async with self._cond:
-                    if exc is None:
-                        self.tcfn[fn] = ('done', tcn)
-                    else:
-                        self.tcfn[fn] = ('err', tcn, exc)
-                    self._cond.notify_all()
-                    return fn, self.tcfn[fn]
-
+                asyncio.gather(
+                    *[
+                        asyncio.create_task(
+                            self.hash_task(fn, new_fn)),
+                        asyncio.create_task(
+                            self.pass_task(fn))
+                    ])
+        except Exception:
+            logging.exception()
         finally:
-            async with self._cond:
-                # Dont have to notify here. Save on signally.
-                self.currentfns.remove(fn)
+            # Dont have to notify here. Save on signally.
+            self.currentfns.remove(fn)
 
-    async def get_file_hash(self, fn):
-        queries, db = self._queries, self._db
-        r = await queries.get_file_hash(db, fn=fn)
-        if r is None:
-            return None, None
-        return r[0]['hashstr'], r[0]['pos'], r[0]['done']
-
-    async def replace_hash_fn(self, hashstr, fn, pos, done):
+    async def replace_pass1(self, fn, done):
         await self.run_bg_task()
-        h = {'fn': fn, 'hashstr': hashstr, 'pos': pos, 'done': done}
+        h = {'fn': fn, 'done': done}
+        async with self._cond:
+            for i, item in enumerate(self._fn_p1_ary):
+                if item['fn'] == fn:
+                    self._fn_p1_ary[i] = h
+                    h = None
+                    break
+            if h is not None:
+                self._fn_p1_ary.append(h)
+            self._cond.notify_all()
+
+    async def replace_hash_fn(self, hashstr, fntype, fn, pos, done):
+        await self.run_bg_task()
+        h = {'fn': fn, 'type': fntype,
+             'hashstr': hashstr, 'pos': pos, 'done': done}
         async with self._cond:
             for i, item in enumerate(self._hash_fn_queue):
-                if item['fn'] == fn:
+                if item['fn'] == fn and item['type'] == fntype:
                     self._hash_fn_queue[i] = h
                     h = None
                     break
@@ -1540,6 +1544,9 @@ class OnlineConfigDbMgr:
 
     async def do_replace_hash_fns(self, queries, db, hash_fn_ary):
         await queries.replace_hash_fns(db, hash_fn_ary)
+
+    async def do_replace_p1_fns_done(self, queries, db, p1_fns_ary):
+        await queries.replace_p1_fns_done(db, p1_fns_ary)
 
     async def do_delete_all_menubreaks(self, queries, db):
         while True:
@@ -1580,7 +1587,6 @@ class OnlineConfigDbMgr:
                      'TRANSCODEDIR': str(CfgMgr.TRANSCODEDIR) + os.path.sep,
                      'PATHSEP': os.path.sep,
                      }
-                await queries.get_file_hash(db, fn="test")
                 await queries.add_local_paths(
                     db,
                     map(lambda x: {'key': x, 'dir': str(h[x])},
@@ -1612,22 +1618,32 @@ class OnlineConfigDbMgr:
             last_hash_time = None
             while True:
                 async with self._cond:
+                    proc_hash_fn_ary = False
+                    need2break = False
                     while True:
                         menubreak_ary = self._menubreak_ary
                         run_load_args = self._run_load_args
+                        fn_p1_ary = self._fn_p1_ary
                         if menubreak_ary is not None:
-                            break
+                            need2break = True
                         if run_load_args is not None:
-                            break
+                            need2break = True
+                        if fn_p1_ary is not None:
+                            need2break = True
                         hash_fn_ary = None
                         if len(self._hash_fn_queue):
                             if (last_hash_time is None or
                                     last_hash_time != time.time() // 5):
                                 last_hash_time = time.time() // 5
                                 hash_fn_ary = self._hash_fn_queue
-                                self._hash_fn_queue = []
-                                break
+                                proc_hash_fn_ary = True
+                                need2break = True
+                        if need2break:
+                            break
                         await asyncio.wait_for(self._cond.wait(), timeout=1)
+                    if proc_hash_fn_ary:
+                        self.hash_fn_queue = []
+
                 try:
                     queries = self._queries
                     await db.execute("BEGIN TRANSACTION")
@@ -1637,6 +1653,10 @@ class OnlineConfigDbMgr:
                         async with self._cond:
                             self._run_load_args = None
                             self._cond.notify_all()
+                    if fn_p1_ary is not None:
+                        print("do p1 fns")
+                        await self.do_replace_p1_fns_done(
+                            queries, db, fn_p1_ary)
                     if hash_fn_ary is not None:
                         await self.do_replace_hash_fns(
                             queries, db, hash_fn_ary)

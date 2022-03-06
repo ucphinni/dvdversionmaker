@@ -158,8 +158,16 @@ CREATE TABLE "localpath" (
 
 CREATE TABLE "hash_file" (
 	"fn"	TEXT NOT NULL,
+	"type"   CHAR NOT NULL CHECK("type" IN ("D","2")),
 	"hashstr"	TEXT NOT NULL,
 	"pos"	INTEGER NOT NULL,
+	"done"	BOOLEAN NOT NULL
+	DEFAULT 0 CHECK("done" = 0 OR "done" = 1),
+	PRIMARY KEY("fn","type")
+);
+
+CREATE TABLE "fn_pass1_done" (
+	"fn"	TEXT NOT NULL,
 	"done"	BOOLEAN NOT NULL
 	DEFAULT 0 CHECK("done" = 0 OR "done" = 1),
 	PRIMARY KEY("fn")
@@ -824,14 +832,24 @@ dfm.renum_menu = :renum_menu and dfm.dvdnum = :dvdnum;
 select distinct dvdnum,ifnull(renum_menu,0) renum_menu,min_dvdmenu from dvdmenufn;
 
 -- name: delete_hash_fn!
-delete from hash_file where fn = :fn;
+delete from hash_file where fn = :fn and type = :fntype;
 
 -- name: get_file_hash
-select * from hash_file where fn = :fn;
+select * from hash_file where fn = :fn and type = :fntype;
 
 -- name: replace_hash_fns*!
-replace into hash_file(fn,hashstr,pos,done)
-VALUES(:fn,:hashstr,:pos,:done);
+replace into hash_file(fn,type,hashstr,pos,done)
+VALUES(:fn,:fntype,:hashstr,:pos,:done);
+
+-- name: delete_fn_pass1_done!
+delete from fn_pass1_done where fn = :fn;
+
+-- name: get_fn_pass1_done
+select * from fn_pass1_done where fn = :fn;
+
+-- name: replace_p1_fns_done*!
+replace into fn_pass1_done(fn,done)
+VALUES(:fn,:done);
 
 -- name: get_dvdmainmenu
 -- this query has the property if the menubreak is removed,
