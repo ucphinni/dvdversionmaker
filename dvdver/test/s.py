@@ -714,7 +714,7 @@ class TaskLoader:
 
 
 class HashLoader(TaskLoader):
-    def __init__(self, ocd, source, fn):
+    def __init__(self, ocd, ftype, source, fn):
         super().__init__(source)
         self._hashstr = None
         self._computed_hashstr = None
@@ -724,6 +724,7 @@ class HashLoader(TaskLoader):
         self._fn = fn
         self._hashalgo = hashlib.blake2b()
         self._cond = asyncio.Condition()
+        self._ftype = ftype
 
     def reset(self):
         super().reset()
@@ -793,7 +794,7 @@ class HashLoader(TaskLoader):
             done = size is not None and pos == self._source.finished_size()
             if pos >= self._pos:
                 ocd, fn = self._ocd, self._fn
-                await ocd.replace_hash_fn(computed_hashstr, fn, pos, done)
+                await ocd.replace_hash_fn(computed_hashstr, fn, self._ftype, pos, done)
                 self._pos = pos
 
             if done:
@@ -949,7 +950,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
 class AsyncStreamTaskMgr:
     __slots__ = ('_afh', '_ahttpclient', '_taskloaders', '_url', '_fname',
                  '_taskme', '_pos', '_taskme', '_running',
-                 '_cond', '_request_download', '_download')
+                 '_cond', '_request_download', '_download', '_file_exists')
 
     def __init__(self, url: str = None, fname: Path = None,
                  ahttpclient: httpx.AsyncClient = None):
@@ -964,6 +965,16 @@ class AsyncStreamTaskMgr:
         self._request_download = False
         self._download = False
         self._cond = asyncio.Condition()
+        self._file_exists = None
+
+    def file_exists(self):
+        if self._file_exists is not None:
+            return self._file_exists
+        try:
+            Path(self._fname).stat().st_size
+            return True
+        finally:
+            return False
 
     async def start_download(self):
         async with self._cond:
@@ -1042,6 +1053,7 @@ class AsyncStreamTaskMgr:
         web_file_sz = None
         try:
             file_sz = Path(self._fname).stat().st_size
+            self._file_exists = True
         except FileNotFoundError:
             file_sz = 0
 
@@ -1056,7 +1068,6 @@ class AsyncStreamTaskMgr:
         if filename != '':
             f = AIOFile(self._fname, 'ab+')
             await f.open()
-        print("start read")
         try:
             if filename != '':
                 self._afh = f
@@ -1099,7 +1110,7 @@ class AsyncStreamTaskMgr:
                             print("Got 206")
                         if (firsttime and resp_code == 200 and
                                 resp.headers['Content-Length']):
-                            web_file_sz = int(resp.headers['Content-Length'])
+                            # web_file_sz = int(resp.headers['Content-Length'])
                             firsttime = False
                             continue
 
@@ -1317,7 +1328,7 @@ class OnlineConfigDbMgr:
             del self.dvd_tasks[dvdnum]
 
     async def fn_wait(
-            self, fn, download=False,
+            self, fn, download=False, hashfn=False,
             pass1=False, pass2=False, download_done=False,
             pass_done=False,  exc=None):
         async with self._cond:
@@ -1325,6 +1336,8 @@ class OnlineConfigDbMgr:
             If you are not the current fn, then delay your excution until
             the current is done for all dvdnums
             '''
+            if hashfn:
+                pass
             if download:
                 while self.dlcnt <= 0 or (
                     fn not in self.currentfns and next(
@@ -1374,11 +1387,11 @@ class OnlineConfigDbMgr:
                     self.tcfn[fn] = ('err', tcn, exc)
                 self._cond.notify_all()
 
-    async def hash_task(self, fn, new_fn=False):
-        await self.fn_wait(fn, hash=True)
+    async def hash_task(self, fn, ftype, new_fn=False):
+        await self.fn_wait(fn, hashfn=True)
         try:
             a = self.fn2astm[fn]
-            hl = HashLoader(self, a, fn)
+            hl = HashLoader(self, ftype, a, fn)
             await hl.load_db_hash(fn)
             a.add_TaskLoader(hl)
 
@@ -1446,6 +1459,7 @@ class OnlineConfigDbMgr:
 
     async def file_task(self, dvdnum, fn, url, ahttpclient, cmp):
         try:
+            print("file_task", fn)
             if cmp < 0:
                 async with self._cond:
                     self.tcfn[fn] = ('done',)
@@ -1492,10 +1506,10 @@ class OnlineConfigDbMgr:
                 self.fn2astm[fn] = a
                 new_fn = not a.file_exists()
                 a.run_task()
-                asyncio.gather(
+                await asyncio.gather(
                     *[
                         asyncio.create_task(
-                            self.hash_task(fn, new_fn)),
+                            self.hash_task(fn, 'D', new_fn)),
                         asyncio.create_task(
                             self.pass_task(fn))
                     ])
@@ -1942,6 +1956,8 @@ class OnlineConfigDbMgr:
         for r in ary:
             dvdnum, fn, url, cmp = (r['dvdnum'], r['filename'],
                                     r['dl_link'], r['cmp'])
+            if fn is None:
+                continue
             if cmp == 0:
                 self.currentfns.add(fn)
             t = asyncio.create_task(
