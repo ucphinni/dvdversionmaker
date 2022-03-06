@@ -14,30 +14,6 @@
 DROP TABLE IF EXISTS "dvdfile_incoming";
 CREATE TEMP TABLE "dvdfile_incoming" as
 select * from dvdfile limit 0;
-DROP TABLE IF EXISTS procpassfile_tmp;
-CREATE TEMP TABLE procpassfile_tmp as
-WITH F AS (SELECT  df.filename,mia.dvdnum,
-CASE WHEN ( df.start_ver <= mia.version <=df.end_ver OR
-df.start_ver <= mia.version AND df.start_ver is not null and df.end_ver is NULL
- OR
-mia.version <=df.end_ver AND df.end_ver is not null and df.start_ver is NULL OR
-df.start_ver is NULL and df.end_ver is NULL
- ) THEN 0
- WHEN (mia.version < df.start_ver) THEN 1
-ELSE -1 END cmp,df.rowid,pf.rowid prowid,
-(case when df.start_secs is null then 0.0 else df.start_secs end ) start_secs,
-(case when df.end_secs is null or df.end_secs > pf.duration then
-pf.duration else df.end_secs end) end_secs,
-pf.pass1done ,pf.pass2done,pf.downloadedhash,pf.pass1hash,pf.pass2hash
-FROM dvdfile df,makeisoavail mia,(
-select cf.*,sf.* from procfile cf
-left join passfile sf on (cf.filename = sf.filename)
-) pf
-WHERE df.dvdnum = mia.dvdnum AND pf.filename = df.filename)
-SELECT * from F
-where rowid <> (SELECT min(rowid) FROM f
-GROUP BY f.filename,f.dvdnum
-HAVING count(*) > 1 AND MAX(cmp));
 
 -- name: finish_load#
 insert into makeisoavail(dvdnum)
@@ -45,14 +21,8 @@ select distinct dvdnum dvdnum  from dvdfile_incoming dfi
 where not exists(select 1 from makeisoavail mia
  where dfi.dvdnum = mia.dvdnum);
 
-insert or replace into procfile
-(filename)
-select dfi.filename from dvdfile_incoming dfi
-where dfi.filename is not null
-and not exists (select 1 from procfile pf where pf.filename = dfi.filename);
 
 insert into dvdfile_summary default values;
-insert into procpassfile_summary default values;
 
 insert into dvdfile_history
 (
@@ -95,58 +65,6 @@ select
 	"dvdnum", "mean_bitrate", "menu","menupart", "start_ver", "end_ver",
 	"cache_bm", "date", "title", "dl_link",	"filename",start_secs,end_secs
 from dvdfile_incoming;
-
-
-
-insert into procpassfile_history
-(
-  summid,action,targetid,
-  filename, cmp,rowid, prowid, start_secs,
-  end_secs,pass1done,pass2done,downloadedhash,pass1hash,
-  pass2hash
-)
-with f as (select 'del' act,a.id, 
-  a.filename, a.cmp,a.rowid, a.prowid,a.start_secs,
-  a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
-  a.pass2hash
-from procpassfile as a left join procpassfile_tmp b
-  on a.filename = b.filename and
-  a.prowid = b.prowid
-where b.filename is NULL  and a.prowid = b.prowid
-union all
-select 'add' act,NULL,
-  a.filename, a.cmp,a.rowid, a.prowid,a.start_secs,
-  a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
-  a.pass2hash
-from procpassfile_tmp as a left join procpassfile b
-  on a.filename = b.filename and
-  a.prowid = b.prowid
-where b.filename is NULL  and a.prowid = b.prowid
-union all
-select 'chg',a.id,
-  a.filename,a.cmp,a.rowid, a.prowid,a.start_secs,
-  a.end_secs,a.pass1done,a.pass2done,a.downloadedhash,a.pass1hash,
-  a.pass2hash
-from procpassfile a inner join procpassfile_tmp b
-on (a.filename = b.filename and a.prowid = b.prowid)
-where a.cmp is b.cmp and a.rowid  is b.rowid and
-   a.start_secs is b.start_secs and
-   a.end_secs is b.end_secs  and a.pass1done is b.pass1done and
-   a.pass2done is b.pass2done and a.downloadedhash is b.downloadedhash and
-   a.pass1hash is b.pass1hash and a.pass2hash is b.pass2hash
-)
-select (select max(id) from procpassfile_summary)id, f.* from f;
-
-
-
-delete from procpassfile;
-INSERT INTO procpassfile
-("filename","cmp","rowid","prowid",
-"start_secs","end_secs","pass1done","pass2done",
-"downloadedhash","pass1hash","pass2hash")
-select "filename","cmp","rowid","prowid",
-"start_secs","end_secs","pass1done","pass2done",
-"downloadedhash","pass1hash","pass2hash" from procpassfile_tmp;
 
 
 -- name: create_schema#
@@ -224,29 +142,6 @@ CREATE TABLE "isoavailddates" (
 	ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE TABLE "procfile" (
-	"filename"	TEXT NOT NULL,
-	"duration"	REAL,
-	"downloadedhash"	TEXT,
-	PRIMARY KEY("filename")
-);
-
-CREATE TABLE "passfile" (
-	"id"	INTEGER NOT NULL,
-
-"filename"	TEXT NOT NULL,
-"pass1done"	BOOLEAN NOT NULL DEFAULT 0
-CHECK("pass1done" = 0 OR "pass1done" = 1),
-"pass1hash"	TEXT CHECK(NOT "pass1done" OR
-"pass1done" AND "pass1hash" <> ''),
-"pass2done"	BOOLEAN NOT NULL DEFAULT 0 CHECK
-("pass2done" = 0 OR "pass2done" = 1),
-"pass2hash"	TEXT CHECK(NOT "pass2done" OR "pass2done"
-AND "pass2hash" <> '' AND "pass1done"),
-PRIMARY KEY("id"),
-FOREIGN KEY("filename") REFERENCES "procfile"("filename")
-ON DELETE RESTRICT ON UPDATE CASCADE
-);
 
 CREATE TABLE "dvdfile" (
 "id"	INTEGER NOT NULL,
@@ -266,54 +161,10 @@ CREATE TABLE "dvdfile" (
 "end_secs"	REAL CHECK(end_secs is null or end_secs >=0 or
                      end_secs is not null and start_secs < end_secs),
 PRIMARY KEY("id" AUTOINCREMENT),
-FOREIGN KEY("filename") REFERENCES "procfile"("filename")
-ON DELETE RESTRICT ON UPDATE CASCADE,
 FOREIGN KEY("dvdnum") REFERENCES "makeisoavail"("dvdnum")
 ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
-CREATE TABLE "procpassfile" (
-	"id"	INTEGER NOT NULL,
-	"filename"	TEXT NOT NULL,
-	"cmp"	INTEGER NOT NULL,
-	"rowid"	INTEGER NOT NULL,
-	"prowid"	INTEGER NOT NULL,
-	"start_secs"	REAL NOT NULL,
-	"end_secs"	REAL,
-	"pass1done"	BOOLEAN NOT NULL,
-	"pass2done"	BOOLEAN NOT NULL,
-	"downloadedhash"	TEXT,
-	"pass1hash"	TEXT,
-	"pass2hash"	TEXT,
-	PRIMARY KEY("id" AUTOINCREMENT)
-);
-
-CREATE TABLE "procpassfile_summary" (
-"id"	INTEGER NOT NULL,
-"timestamp"	TIMESTAMP NOT NULL DEFAULT (datetime('now','localtime')),
-PRIMARY KEY("id")
-);
-
-CREATE TABLE "procpassfile_history" (
-	"id"	INTEGER NOT NULL,
-	"summid"	INTEGER NOT NULL,
-	"action"	TEXT NOT NULL,
-	"targetid"	INTEGER,
-	"filename"	TEXT NOT NULL,
-	"cmp"	INTEGER NOT NULL,
-	"rowid"	INTEGER NOT NULL,
-	"prowid"	INTEGER,
-	"start_secs"	REAL NOT NULL,
-	"end_secs"	REAL,
-	"pass1done"	BOOLEAN NOT NULL,
-	"pass2done"	BOOLEAN NOT NULL,
-	"downloadedhash"	INTEGER,
-	"pass1hash"	TEXT,
-	"pass2hash"	TEXT,
-	FOREIGN KEY("summid") REFERENCES "procpassfile_summary"("id")
-	   ON DELETE CASCADE,
-	PRIMARY KEY("id")
-);
 
 create view menufn as
 with h as (select dfm.dvdnum, dfm.renum_menu,max(dfm.id)id, dfm.menu from dvdfilemenu dfm
@@ -786,13 +637,9 @@ mia.version <=df.end_ver AND df.end_ver is not null and df.start_ver is NULL OR
 df.start_ver is NULL and df.end_ver is NULL
  ) THEN 0
  WHEN (mia.version < df.start_ver) THEN 1
-ELSE -1 END cmp,df.rowid,pf.rowid prowid, df.dl_link,pf.pass1done
-,pf.pass2done,pf.downloadedhash,pf.pass1hash,pf.pass2hash
-FROM dvdfile df,makeisoavail mia,(
-select cf.*,sf.* from procfile cf
-left join passfile sf on (cf.filename = sf.filename)
-) pf
-WHERE df.dvdnum = mia.dvdnum AND pf.filename = df.filename)
+ELSE -1 END cmp,df.rowid, df.dl_link
+FROM dvdfile df,makeisoavail mia
+WHERE df.dvdnum = mia.dvdnum)
 SELECT * from F
 where rowid NOT IN (SELECT min(rowid) FROM f
 GROUP BY f.filename,f.dvdnum
