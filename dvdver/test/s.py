@@ -1242,7 +1242,7 @@ class OnlineConfigDbMgr:
         self._finishq = asyncio.Queue()
         self._run_load_args = None
         self._hash_fn_queue = []
-        self._fn_p1_ary = []
+        self._fn_p1_ary = None
         self._bg_task = None
         self._menubreak_ary = None
         self.fn2astm = {}
@@ -1666,10 +1666,13 @@ class OnlineConfigDbMgr:
                             queries, db, menubreak_ary)
                         await self.do_add_menubreak_rows(
                             queries, db, menubreak_ary)
+                    await db.commit()
+                    if (menubreak_ary is not None or
+                            fn_p1_ary is not None):
                         async with self._cond:
                             self._menubreak_ary = None
+                            self._fn_p1_ary = None
                             self._cond.notify_all()
-                    await db.commit()
                 except Exception:
                     logging.exception()
                     await db.rollback()
