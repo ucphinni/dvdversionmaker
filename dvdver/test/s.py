@@ -8,13 +8,13 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import threading
 import time
 import traceback
 
 from PIL import ImageFont, ImageDraw, Image
 from aiofile import (AIOFile, LineReader, Writer, Reader)
 import aiosql
-import aiosqlite
 import httpx
 
 from cfgmgr import CfgMgr
@@ -732,7 +732,6 @@ class HashLoader(TaskLoader):
 
     def bad_file(self, fn):
         fn = fn
-        assert False
 
     async def wait_for_hash(self):
         async with self._cond:
@@ -746,13 +745,14 @@ class HashLoader(TaskLoader):
                 self._computed_hashstr == self._hashstr)
 
     async def handle_source_eos(self):
-        pass
+        print("eos received")
+        self.add_chunk(None, None)
 
     async def load_db_hash(self, fn):
         try:
             hashstr, pos, done = None, 0, False
             with sqlite3.connect(CfgMgr.DLDIR / 'dl.db') as db:
-                db.row_factory = aiosqlite.Row
+                db.row_factory = sqlite3.Row
                 cur = db.execute(
                     "select * from hash_file where fn = ?", (fn,))
                 r = cur.fetchone()
@@ -773,40 +773,38 @@ class HashLoader(TaskLoader):
             return self._hashstr is not None
 
     async def _send_chunk(self, chunk):
+        await self._hash_chunk(chunk)
+
+    async def _hash_chunk(self, chunk):
         #        self._pos += len(chunk)
         try:
             assert self._pos is not None
-            self._hashalgo.update(chunk)
             pos = self._last_proc_chunk_end_pos
-            if pos < self._pos:
-                return
             if (pos >= self._pos and
-                    self._last_proc_chunk_start_pos <= self._pos and
-                    self._pos <= self._last_proc_chunk_end_pos):
+                    self._last_proc_chunk_start_pos < self._pos):
                 p1 = chunk[:self._pos - self._last_proc_chunk_start_pos]
                 self._hashalgo.update(p1)
-                computed_hashstr = self._hashalgo.digest()
                 if (self._pos and self._hashstr is not None and
-                        self._hashstr != computed_hashstr):
+                        self._hashstr != self._hashalgo.digest()):
                     self.bad_file(self._fn)
                 chunk = chunk[self._pos - self._last_proc_chunk_start_pos:]
-            computed_hashstr = self._hashalgo.digest()
-            size = self._source.finished_size()
-            done = size is not None and pos == self._source.finished_size()
-            if pos >= self._pos:
+
+            if pos > self._pos:
                 self._pos = pos
                 ocd, fn = self._ocd, self._fn
+                size = self._source.finished_size()
+                done = size is not None and pos == self._source.finished_size()
                 await ocd.replace_hash_fn(
-                    computed_hashstr, fn, self._ftype, self._pos, done,
+                    self._hashalgo, fn, self._ftype, self,
                     wait4commit=done)
+                assert size is None or self._last_proc_chunk_end_pos <= size
 
             if done:
                 self._source.remove_TaskLoader(self)
                 async with self._cond:
-                    self._computed_hashstr = computed_hashstr
+                    self._computed_hashstr = self._hashalgo.digest()
                     self._cond.notify_all()
                 self.stop()
-            assert size is None or self._last_proc_chunk_end_pos <= size
         except AssertionError:
             logging.exception(self._fn)
         return
@@ -1247,7 +1245,7 @@ class OnlineConfigDbMgr:
         self._session = session
         self._dvd_tab_url = dvd_tab_url
         self._queries = None
-        self._cond = asyncio.Condition()
+        self._cond = threading.Condition()
         self._done = False
         self._load = False
         self._db_chg = False
@@ -1531,81 +1529,6 @@ class OnlineConfigDbMgr:
             # Dont have to notify here. Save on signally.
             self.currentfns.remove(fn)
 
-    async def replace_pass1(self, fn, done):
-        await self.run_bg_task()
-        h = {'fn': fn, 'done': done}
-        async with self._cond:
-            for i, item in enumerate(self._fn_p1_ary):
-                if item['fn'] == fn:
-                    self._fn_p1_ary[i] = h
-                    h = None
-                    break
-            if h is not None:
-                self._fn_p1_ary.append(h)
-            self._cond.notify_all()
-
-    async def replace_hash_fn(
-            self, hashstr, fntype, fn, pos, done,
-            wait4commit=False):
-        await self.run_bg_task()
-        h = {'fn': fn, 'type': fntype,
-             'hashstr': hashstr, 'pos': pos, 'done': done}
-        async with self._cond:
-            for i, item in enumerate(self._hash_fn_queue):
-                if item['fn'] == fn and item['type'] == fntype:
-                    self._hash_fn_queue[i] = h
-                    h = None
-                    break
-            if h is not None:
-                self._hash_fn_queue.append(h)
-            self._cond.notify_all()
-            self._wait4commit = wait4commit
-            while self._wait4commit:
-                await self._cond.wait()
-
-    async def add_menubreak_rows(self, ary):
-        await self.run_bg_task()
-        async with self._cond:
-            while self._menubreak_ary is not None:
-                await self._cond.wait()
-            self._menubreak_ary = ary
-            self._cond.notify_all()
-            while self._menubreak_ary is not None:
-                await self._cond.wait()
-
-    async def do_replace_hash_fns(self, queries, db, hash_fn_ary):
-        await queries.replace_hash_fns(db, hash_fn_ary)
-
-    async def do_replace_p1_fns_done(self, queries, db, p1_fns_ary):
-        await queries.replace_p1_fns_done(db, p1_fns_ary)
-
-    async def do_delete_all_menubreaks(self, queries, db):
-        while True:
-            try:
-                await queries.delete_all_menubreaks(db)
-            except sqlite3.OperationalError:
-                continue
-
-    async def run_load(self, create_schema=False):
-        await self.run_bg_task()
-        arg = {'create_schema': create_schema}
-        async with self._cond:
-            while self._run_load_args is not None:
-                await self._cond.wait()
-            self._run_load_args = arg
-            self._cond.notify_all()
-            while self._run_load_args is not None:
-                await self._cond.wait()
-
-    async def do_add_menubreak_rows(self, queries, db, menubreak_ary):
-        if len(menubreak_ary) == 0:
-            return
-
-        while True:
-            try:
-                await queries.add_menubreak_rows(db, menubreak_ary)
-            except sqlite3.OperationalError:
-                continue
 
 # Not only should there be a wait for dvdfile_load there should be a
 # dvdfile_reading and done reading.  Realistically, that is not needed.
@@ -1622,6 +1545,7 @@ class OnlineConfigDbMgr:
     async def do_run_load(self, queries, db, create_schema=False):
         while True:
             try:
+                await db.execute("BEGIN TRANSACTION")
                 if create_schema:
                     await queries.create_schema(db)
                 await queries.delete_all_local_paths(db)
@@ -1630,16 +1554,19 @@ class OnlineConfigDbMgr:
                      'TRANSCODEDIR': str(CfgMgr.TRANSCODEDIR) + os.path.sep,
                      'PATHSEP': os.path.sep,
                      }
-                await queries.add_local_paths(
-                    db,
-                    map(lambda x: {'key': x, 'dir': str(h[x])},
-                        h.keys())
-                )
+                async with sqlite3.connect(self._dbfn) as conn:
+                    await setup_db_conn(conn)
+                    await queries.add_local_paths(
+                        conn,
+                        map(lambda x: {'key': x, 'dir': str(h[x])},
+                            h.keys())
+                    )
                 print("start")
                 async with self._cond:
                     self._dvdfile_loading = True
                     self._cond.notify_all()
                 await queries.start_load(db)
+                await db.commit()
                 print("read")
                 await self._read_url_config(db)
                 print("finish_load")
@@ -1649,10 +1576,8 @@ class OnlineConfigDbMgr:
                     self._cond.notify_all()
                     if self._dvdfile_load_wait_cnt:
                         await db.commit()
-                        await db.execute("BEGIN TRANSACTION")
                 print("create_setup_files")
                 await self.create_setup_files(db)
-                print("done load")
                 break
             except sqlite3.OperationalError:
                 print(traceback.format_exc())
@@ -1662,10 +1587,11 @@ class OnlineConfigDbMgr:
                 logging.exception()
                 await db.rollback()
                 continue
+        print("done load")
 
     async def _run_bg_task(self):
-        async with aiosqlite.connect(self._dbfn) as db:
-            await setup_db_conn(db)
+        async with sqlite3.connect(self._dbfn) as db:
+            setup_db_conn(db)
             last_hash_time = None
             while True:
                 async with self._cond:
@@ -1684,20 +1610,19 @@ class OnlineConfigDbMgr:
                         hash_fn_ary = None
                         if len(self._hash_fn_queue):
                             if (last_hash_time is None or
-                                    last_hash_time != time.time() // 5):
-                                last_hash_time = time.time() // 5
+                                    last_hash_time != time.time() // 11):
+                                last_hash_time = time.time() // 11
                                 hash_fn_ary = self._hash_fn_queue
                                 proc_hash_fn_ary = True
                                 need2break = True
                         if need2break:
                             break
-                        await asyncio.wait_for(self._cond.wait(), timeout=1)
+                        await self._cond.wait()
                     if proc_hash_fn_ary:
                         self.hash_fn_queue = []
 
                 try:
                     queries = self._queries
-                    await db.execute("BEGIN TRANSACTION")
                     if run_load_args is not None:
                         print("running load")
                         await self.do_run_load(queries, db, **run_load_args)
@@ -1709,15 +1634,16 @@ class OnlineConfigDbMgr:
                         await self.do_replace_p1_fns_done(
                             queries, db, fn_p1_ary)
                     if hash_fn_ary is not None:
+                        print("hash_fn_ary")
                         await self.do_replace_hash_fns(
                             queries, db, hash_fn_ary)
+                        print("end hash_fn_ary")
                     if menubreak_ary is not None:
                         print("do menu")
                         await self.do_delete_all_menubreaks(
                             queries, db, menubreak_ary)
                         await self.do_add_menubreak_rows(
                             queries, db, menubreak_ary)
-                    await db.commit()
                     if (menubreak_ary is not None or
                             fn_p1_ary is not None):
                         async with self._cond:
@@ -1726,14 +1652,12 @@ class OnlineConfigDbMgr:
                             self._cond.notify_all()
                 except Exception:
                     logging.exception()
-                    await db.rollback()
                     continue
 
-    async def run_bg_task(self):
+    def run_bg_task(self):
         if self._bg_task is not None:
             return
         self._bg_task = CfgMgr.create_task(self._run_bg_task())
-        await asyncio.sleep(0)
 
     async def _parse_streamed_lines(self, resp_lines, db):
         async for line in resp_lines:
@@ -1782,7 +1706,7 @@ class OnlineConfigDbMgr:
                  }
             if h['start_secs'] is None:
                 h['start_secs'] = 0.0
-            await self._queries.add_dvd_menu_row(db, **h)
+            self._queries.add_dvd_menu_row(db, **h)
 
     async def _read_url_config(self, db):
 
@@ -1822,11 +1746,9 @@ class OnlineConfigDbMgr:
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.touch()
                 return file
-            drary, mfary, dvdary = await asyncio.gather(
-                queries.get_dvd_files(db),
-                queries.get_menu_files(db),
-                queries.get_all_dvdfilemenu_rows(db)
-            )
+            drary = queries.get_dvd_files(db)
+            mfary = queries.get_menu_files(db)
+            dvdary = queries.get_all_dvdfilemenu_rows(db)
 
             async def write_xmlrows2file(fn, rows):
                 async with AIOFile(fn, 'w') as f:
@@ -1843,7 +1765,7 @@ class OnlineConfigDbMgr:
             menusels = {}
             menubuild_rm = defaultdict(lambda: {})
             selfn = set()
-            await queries.delete_all_menubreaks(db)
+            queries.delete_all_menubreaks(db)
 
             for row in mfary:
                 # For right now, we will only use one menu selector per disk
@@ -1871,10 +1793,9 @@ class OnlineConfigDbMgr:
                 menubuild_rm[dvdnum][renum_menu] = mb
                 await mb.gen_db_menubreak_rows(dvdfilemenu_ary=dvdary)
             print("gather 1")
-            daary, dsary = await asyncio.gather(
-                queries.get_dvd_files(db),
-                queries.get_dvdmenu_files(db)
-            )
+            daary = queries.get_dvd_files(db)
+            dsary = queries.get_dvdmenu_files(db)
+
             for row in mfary:
                 dvdnum = row['dvdnum']
                 renum_menu = row['renum_menu']
@@ -1909,7 +1830,7 @@ class OnlineConfigDbMgr:
                         menubuild_rm[dvdnum][renum_menu].finish_files())
             for i, _ in enumerate(qq):
                 xfn = CfgMgr.MENUDIR / qq[i][2]
-                ary = await queries.get_spumux_rows(
+                ary = queries.get_spumux_rows(
                     db, dvdnum=qq[i][0], dvdmenu=qq[i][1])
                 fftasks.append(write_xmlrows2file(xfn, ary))
             # for dvdauthor
@@ -1986,10 +1907,9 @@ class OnlineConfigDbMgr:
 
     async def load_obj(self):
         await self.wait_for_dvdfile_load()
-        print("out of dvd")
         db = self._db
         queries = self._queries
-        ary = await queries.get_filenames(db)
+        ary = queries.get_filenames(db)
         fns = set()
         fnst = set()
         for r in ary:
@@ -2028,22 +1948,16 @@ class OnlineConfigDbMgr:
             self._cond.notify_all()
 
     async def run(self, dbexists=False):
-        self._queries = aiosql.from_path(CfgMgr.SQLFILE, "aiosqlite")
+        self._queries = aiosql.from_path(CfgMgr.SQLFILE, "sqlite3")
 
-        async with aiosqlite.connect(str(self._dbfn)) as db:
-            await setup_db_conn(db)
+        with sqlite3.connect(str(self._dbfn)) as db:
+            setup_db_conn(db)
             self._db = db
             await asyncio.gather(*[
                 asyncio.create_task(self.run_load(create_schema=not dbexists)),
                 asyncio.create_task(self.load_obj())
             ])
 
-
-async def setup_db_conn(conn):
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("PRAGMA foreign_keys=ON")
-    await conn.execute("PRAGMA read_uncommitted=ON")
-    conn.row_factory = aiosqlite.Row
 
 global ocd
 ocd = None
@@ -2062,10 +1976,6 @@ async def main_async_func():
         loop.stop()
         return
     dbexists = dbfn.exists()
-    if DEBUG:
-        dbexists = False
-        if dbfn.exists():
-            dbfn.unlink()
 
     async with httpx.AsyncClient(
             http2=True, follow_redirects=True) as session:

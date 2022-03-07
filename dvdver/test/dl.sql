@@ -709,6 +709,6 @@ select * from dvdmainmenu;
 -- name: delete_all_local_paths!
 delete from localpath;
 
--- name: add_local_paths*!
+-- name: add_local_paths!
 insert into localpath(key,dir)
 values(:key,:dir);
