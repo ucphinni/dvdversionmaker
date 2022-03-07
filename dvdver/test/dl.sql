@@ -686,7 +686,7 @@ select * from hash_file where fn = :fn and type = :fntype;
 
 -- name: replace_hash_fns*!
 replace into hash_file(fn,type,hashstr,pos,done)
-VALUES(:fn,:fntype,:hashstr,:pos,:done);
+VALUES(:fn,:type,:hashstr,:pos,:done);
 
 -- name: delete_fn_pass1_done!
 delete from fn_pass1_done where fn = :fn;

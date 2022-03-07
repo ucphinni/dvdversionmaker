@@ -746,7 +746,8 @@ class HashLoader(TaskLoader):
                 self._computed_hashstr == self._hashstr)
 
     async def handle_source_eos(self):
-        pass
+        print("eos received")
+        self.add_chunk(None, None)
 
     async def load_db_hash(self, fn):
         try:
@@ -773,40 +774,38 @@ class HashLoader(TaskLoader):
             return self._hashstr is not None
 
     async def _send_chunk(self, chunk):
+        await self._hash_chunk(chunk)
+
+    async def _hash_chunk(self, chunk):
         #        self._pos += len(chunk)
         try:
             assert self._pos is not None
-            self._hashalgo.update(chunk)
             pos = self._last_proc_chunk_end_pos
-            if pos < self._pos:
-                return
             if (pos >= self._pos and
-                    self._last_proc_chunk_start_pos <= self._pos and
-                    self._pos <= self._last_proc_chunk_end_pos):
+                    self._last_proc_chunk_start_pos < self._pos):
                 p1 = chunk[:self._pos - self._last_proc_chunk_start_pos]
                 self._hashalgo.update(p1)
-                computed_hashstr = self._hashalgo.digest()
                 if (self._pos and self._hashstr is not None and
-                        self._hashstr != computed_hashstr):
+                        self._hashstr != self._hashalgo.digest()):
                     self.bad_file(self._fn)
                 chunk = chunk[self._pos - self._last_proc_chunk_start_pos:]
-            computed_hashstr = self._hashalgo.digest()
-            size = self._source.finished_size()
-            done = size is not None and pos == self._source.finished_size()
-            if pos >= self._pos:
+
+            if pos > self._pos:
                 self._pos = pos
                 ocd, fn = self._ocd, self._fn
+                size = self._source.finished_size()
+                done = size is not None and pos == self._source.finished_size()
                 await ocd.replace_hash_fn(
-                    computed_hashstr, fn, self._ftype, self._pos, done,
+                    self._hashalgo, fn, self._ftype, self,
                     wait4commit=done)
+                assert size is None or self._last_proc_chunk_end_pos <= size
 
             if done:
                 self._source.remove_TaskLoader(self)
                 async with self._cond:
-                    self._computed_hashstr = computed_hashstr
+                    self._computed_hashstr = self._hashalgo.digest()
                     self._cond.notify_all()
                 self.stop()
-            assert size is None or self._last_proc_chunk_end_pos <= size
         except AssertionError:
             logging.exception(self._fn)
         return
@@ -1583,8 +1582,12 @@ class OnlineConfigDbMgr:
         while True:
             try:
                 await queries.delete_all_menubreaks(db)
+                break
             except sqlite3.OperationalError:
-                continue
+                pass
+            except Exception:
+                logging.exception("delete")
+                break
 
     async def run_load(self, create_schema=False):
         await self.run_bg_task()
@@ -1604,8 +1607,12 @@ class OnlineConfigDbMgr:
         while True:
             try:
                 await queries.add_menubreak_rows(db, menubreak_ary)
+                break
             except sqlite3.OperationalError:
-                continue
+                pass
+            except Exception:
+                logging.exception("menubreak")
+                break
 
 # Not only should there be a wait for dvdfile_load there should be a
 # dvdfile_reading and done reading.  Realistically, that is not needed.
@@ -1733,7 +1740,6 @@ class OnlineConfigDbMgr:
         if self._bg_task is not None:
             return
         self._bg_task = CfgMgr.create_task(self._run_bg_task())
-        await asyncio.sleep(0)
 
     async def _parse_streamed_lines(self, resp_lines, db):
         async for line in resp_lines:
