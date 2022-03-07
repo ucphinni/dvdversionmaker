@@ -22,30 +22,58 @@ def setup_db_conn(conn):
 
 
 class HashPos:
-    def __init__(self, hashalgoobj, end_pos=0):
+    def __init__(
+            self, hashalgoobj, end_pos=None, loaded_hash_str=None):
         self._hashalgoobj = hashalgoobj
-        self._pos = end_pos
+        if end_pos is None:
+            end_pos = 0
+        self.load_pos = end_pos
+        self.isgood = True
+        if end_pos == 0 and loaded_hash_str is None:
+            loaded_hash_str = hashalgoobj.digest()
+        else:
+            assert end_pos != 0 or loaded_hash_str == hashalgoobj.digest()
+
+        self.loaded_hash_str = loaded_hash_str
+        self._pos = 0
         self._done = False
         self.lock = threading.Lock()
 
-    def update(self, buff, end_pos) -> int:
+    def update(self, buff):
         n = len(buff)
-        delta = end_pos - self._pos
-        assert n <= end_pos and delta >= 0 and not self._done
-        if delta < n:
-            buff = buff[n - delta:delta]
         with self.lock:
-            self._hashalgoobj.update(buff)
-            self._pos = end_pos
-        return delta
+            if (self._pos >= self.load_pos or self._pos + n < self.load_pos):
+                self._hashalgoobj.update(buff)
+                self._pos += n
+                return
+            postloadn = self._pos + n - self.load_pos
+            preloadn = n - postloadn
+            self._hashalgoobj.update(buff[0:preloadn])
+            if self.isgood and self.loaded_hash_str is not None:
+                self.isgood = (
+                    self._hashalgoobj.digest() == self.loaded_hash_str)
+            if postloadn:
+                self._hashalgoobj.update(buff[preloadn:postloadn])
 
-    def finished(self):
+    def set_done(self):
         with self.lock:
             self._done = True
 
     def get_props(self):
         with self.lock:
             return self._hashalgoobj.digest(), self._pos, self._done
+
+    def get_pos(self):
+        with self.lock:
+            return self._pos
+
+    def good(self):
+        with self.lock:
+            return self.isgood
+
+    def checking(self):
+        with self.lock:
+            return self._pos < self.load_pos
 
 
 '''
@@ -131,50 +159,159 @@ class DbMgr(threading.Thread):
         self._queries = aiosql.from_path(CfgMgr.SQLFILE, "sqlite3")
         self._dbfn = dbfn
         self.dbhf = DbHashFile(dbfn, self._queries)
+        self.dbhf.start()
         self._fn_p1_ary = []
 
+    def put_hash_fn(
+            self, fn, fntype, hashposobj,
+            wait4commit=False):
+        self.dbfn.put_hash_fn(fn, fntype, hashposobj, wait4commit=wait4commit)
+
     def replace_pass1(self, fn, done):
-        h = {'fn': fn, 'done': done}
-        with self._cond:
-            for i, item in enumerate(self._fn_p1_ary):
-                if item['fn'] == fn:
-                    self._fn_p1_ary[i] = h
-                    h = None
-                    break
-            if h is not None:
-                self._fn_p1_ary.append(h)
-            self._cond.notify_all()
-
-    def add_menubreak_rows(self, ary):
-        with self._cond:
-            while self._menubreak_ary is not None:
-                self._cond.wait()
-            self._menubreak_ary = ary
-            self._cond.notify_all()
-            while self._menubreak_ary is not None:
-                self._cond.wait()
-
-    def do_replace_p1_fns_done(self, queries, db, p1_fns_ary):
-        while True:
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
             try:
-                queries.replace_p1_fns_done(db, p1_fns_ary)
-                break
-            except sqlite3.OperationalError:
-                continue
+                setup_db_conn(db)
+                queries.replace_p1_fns_done(db, fn=fn, done=done)
             except Exception:
                 logging.exception()
-                break
 
-    def do_delete_all_menubreaks(self, queries, db):
-        while True:
+    def add_local_paths(self, ary):
+        queries = self._queries
+        if len(ary) == 0:
+            return
+        with sqlite3.connect(self._dbfn) as db:
             try:
+                setup_db_conn(db)
+                queries.delete_all_local_paths(db)
+                queries.add_local_paths(db, ary)
+            except Exception:
+                logging.exception()
+
+    def add_menubreak_rows(self, menubreak_ary):
+        queries = self._queries
+        if len(menubreak_ary) == 0:
+            return
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.add_menubreak_rows(db, menubreak_ary)
+            except Exception:
+                logging.exception()
+
+    def add_dvd_menu_row(self, **h):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.add_dvd_menu_row(db, **h)
+            except Exception:
+                logging.exception()
+
+    def get_fn_hash(self, fn, fntype):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                r = queries.load_db_hash(db, fn, fntype)
+                if r is None:
+                    return None, None, None
+                r = r[0]
+                return r['hashstr'], r['pos'], r['done']
+            except Exception:
+                logging.exception()
+
+    def delete_all_menubreaks(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
                 queries.delete_all_menubreaks(db)
-                break
-            except sqlite3.OperationalError:
-                continue
             except Exception:
                 logging.exception()
-                break
+
+    def create_schema(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.create_schema(db)
+            except Exception:
+                logging.exception()
+
+    def start_load(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.start_load(db)
+            except Exception:
+                logging.exception()
+
+    def finish_load(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.finish_load(db)
+            except Exception:
+                logging.exception()
+
+    def get_spumux_rows(self, dvdnum, dvdmenu):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_spumux_rows(
+                    db, dvdnum=dvdnum, dvdmenu=dvdmenu)
+            except Exception:
+                logging.exception()
+
+    def get_dvdauthor_rows(self, dvdnum):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_dvdauthor_rows(
+                    db, dvdnum=dvdnum)
+            except Exception:
+                logging.exception()
+
+    def get_dvd_files(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_dvd_files(db)
+            except Exception:
+                logging.exception()
+
+    def get_dvdmenu_files(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_dvdmenu_files(db)
+            except Exception:
+                logging.exception()
+
+    def get_menu_files(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_menu_files(db)
+            except Exception:
+                logging.exception()
+
+    def get_all_dvdfilemenu_rows(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_all_dvdfilemenu_rows(db)
+            except Exception:
+                logging.exception()
 
     def run_load(self, create_schema=False):
         arg = {'create_schema': create_schema}
@@ -185,20 +322,6 @@ class DbMgr(threading.Thread):
             self._cond.notify_all()
             while self._run_load_args is not None:
                 self._cond.wait()
-
-    def do_add_menubreak_rows(self, queries, db, menubreak_ary):
-        if len(menubreak_ary) == 0:
-            return
-
-        while True:
-            try:
-                queries.add_menubreak_rows(db, menubreak_ary)
-                break
-            except sqlite3.OperationalError:
-                continue
-            except Exception:
-                logging.exception()
-                break
 
     def run(self):
         with sqlite3.connect(self._dbfn) as db:

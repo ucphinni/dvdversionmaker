@@ -694,7 +694,7 @@ delete from fn_pass1_done where fn = :fn;
 -- name: get_fn_pass1_done
 select * from fn_pass1_done where fn = :fn;
 
--- name: replace_p1_fns_done*!
+-- name: replace_p1_fns_done!
 replace into fn_pass1_done(fn,done)
 VALUES(:fn,:done);
 
