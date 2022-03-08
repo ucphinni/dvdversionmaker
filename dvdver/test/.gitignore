@@ -1,2 +1,5 @@
-/aiosubprocess.py
 /__pycache__/
+/download_dir/
+/menu/
+/transcode/
+
