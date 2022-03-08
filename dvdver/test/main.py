@@ -93,7 +93,8 @@ USAGE
         parser.add_argument('-V', '--version', action='version',
                             version=program_version_message)
         parser.add_argument("-d", "--dldir",
-                            dest="dldir", help="DL to folder(s) with source file(s) "
+                            dest="dldir",
+                            help="DL to folder(s) with source file(s) "
                             "[default: %(default)s]", metavar="path")
 
         async def main():
@@ -113,7 +114,7 @@ USAGE
 
         args = parser.parse_args()
 
-        paths = args.dldir
+        # paths = args.dldir
         verbose = args.verbose
 
         if verbose > 0:
@@ -124,7 +125,6 @@ USAGE
         #        "include and exclude pattern "
         # "are equal! Nothing will be processed.")
     except KeyboardInterrupt:
-        ### handle keyboard interrupt ###
         return 0
     except Exception as e:
         if DEBUG or TESTRUN:
