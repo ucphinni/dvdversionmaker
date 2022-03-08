@@ -112,7 +112,6 @@ class DbHashFile(threading.Thread):
             wait4commit=False):
         with self._cond:
             self._fns[fn][fntype] = hashposobj
-            self._cond.notify_all()
             if wait4commit:
                 while self._processing:
                     self._cond.wait()
@@ -124,32 +123,33 @@ class DbHashFile(threading.Thread):
     def do_replace_hash_fns(self, queries, db):
         hash_fn_ary = []
         new_fns = defaultdict(lambda: {})
+        while True:
+            with self._cond:
+                self._processing = True
 
-        with self._cond:
-            self._processing = True
-
-            for fn, h in self._fns.items():
-                for fntype, hashpos in h.items():
-                    hashstr, pos, done = hashpos.get_props()
-                    hash_fn_ary.append({
-                        'fn': fn,
-                        'fntype': fntype,
-                        'hashstr': hashstr,
-                        'pos': pos,
-                        'done': done,
-                    })
-            self._fns = new_fns
-            wait4commit = self._wait4commit
-            if wait4commit:
+                for fn, h in self._fns.items():
+                    for fntype, hashpos in h.items():
+                        hashstr, pos, done = hashpos.get_props()
+                        hash_fn_ary.append({
+                            'fn': fn,
+                            'fntype': fntype,
+                            'hashstr': hashstr,
+                            'pos': pos,
+                            'done': done,
+                        })
+                self._fns = new_fns
+            try:
                 queries.replace_hash_fns(db, hash_fn_ary)
                 db.commit()
-            self._cond.notify_all()
-        if not wait4commit:
-            queries.replace_hash_fns(db, hash_fn_ary)
-            db.commit()
-        with self._cond:
-            self._processing = False
-            self._cond.notify_all()
+            except sqlite3.OperationalError:
+                continue  # pypy intermentant failures.
+
+            with self._cond:
+                self._wait4commit = False
+                self._processing = False
+                self._cond.notify_all()
+            break
+        return
 
     def clock(self):
         return time.monotonic()
@@ -222,11 +222,16 @@ class DbMgr():
         if len(menubreak_ary) == 0:
             return
         with sqlite3.connect(self._dbfn) as db:
-            try:
-                setup_db_conn(db)
-                queries.add_menubreak_rows(db, menubreak_ary)
-            except Exception:
-                logging.exception("add_menubreak_rows")
+            setup_db_conn(db)
+            while True:
+                try:
+                    queries.add_menubreak_rows(db, menubreak_ary)
+                    break
+                except sqlite3.OperationalError:
+                    pass  # for pypy intermentant failures.
+                except Exception:
+                    logging.exception("add_menubreak_rows")
+                    break
 
     async def add_dvd_menu_row(self, h):
         return await self.arun_exc(self._add_dvd_menu_row,  h)
@@ -297,27 +302,25 @@ class DbMgr():
                     queries.create_schema(db)
                 queries.delete_all_local_paths(db)
                 queries.add_local_paths(db, hary)
-                queries.start_load(db)
+                while True:
+                    try:
+                        queries.start_load(db)
+                        break
+                    except sqlite3.OperationalError:
+                        continue  # Immediate retry this for pypy
+                    except Exception:
+                        raise
+
                 while True:
                     h = q.get()
                     if h is None:
                         break
                     queries.add_dvd_menu_row(db, **h)
                 queries.finish_load(db)
+                db.commit()
 
             except Exception:
                 logging.exception("create_schema")
-
-    async def finish_load(self):
-        return await self.arun_exc(self._finish_load)
-
-    def _finish_load(self):
-        queries = self._queries
-        with sqlite3.connect(self._dbfn) as db:
-            try:
-                setup_db_conn(db)
-            except Exception:
-                logging.exception("finish_load")
 
     async def get_spumux_rows(self, dvdnum, dvdmenu):
         return await self.arun_exc(self._get_spumux_rows, dvdnum, dvdmenu)

@@ -772,9 +772,12 @@ class HashLoader(TaskLoader):
                 return
             if self.hpos.checking():
                 return
+            done = False
             size = self._source.finished_size()
-            pos = await self.hpos.get_pos()
-            done = size is not None and pos == self._source.finished_size()
+            if size is not None:
+                pos = await self.hpos.get_pos()
+                done = pos == size
+                assert pos <= size
             if done:
                 await self.hpos.set_done()
             await dbmgr.put_hash_fn(
