@@ -16,6 +16,7 @@ CREATE TEMP TABLE "dvdfile_incoming" as
 select * from dvdfile limit 0;
 
 -- name: finish_load#
+
 insert into makeisoavail(dvdnum)
 select distinct dvdnum dvdnum  from dvdfile_incoming dfi
 where not exists(select 1 from makeisoavail mia
@@ -675,6 +676,7 @@ from dvdmainmenu dmm,dvdfile df,dvdfilemenu dfm
 where df.id = dmm.id and dfm.menu = df.menu and
 dfm.renum_menu = :renum_menu and dfm.dvdnum = :dvdnum;
 
+
 -- name: get_min_dvdmenus
 select distinct dvdnum,ifnull(renum_menu,0) renum_menu,min_dvdmenu from dvdmenufn;
 
@@ -686,7 +688,7 @@ select * from hash_file where fn = :fn and type = :fntype;
 
 -- name: replace_hash_fns*!
 replace into hash_file(fn,type,hashstr,pos,done)
-VALUES(:fn,:type,:hashstr,:pos,:done);
+VALUES(:fn,:fntype,:hashstr,:pos,:done);
 
 -- name: delete_fn_pass1_done!
 delete from fn_pass1_done where fn = :fn;
@@ -694,7 +696,7 @@ delete from fn_pass1_done where fn = :fn;
 -- name: get_fn_pass1_done
 select * from fn_pass1_done where fn = :fn;
 
--- name: replace_p1_fns_done*!
+-- name: replace_p1_fns_done!
 replace into fn_pass1_done(fn,done)
 VALUES(:fn,:done);
 

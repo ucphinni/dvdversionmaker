@@ -25,16 +25,16 @@ from pathlib import Path
 import sys
 
 from cfgmgr import CfgMgr
-CfgMgr.set_paths(Path(__file__).parent / 'download_dir',
-                 Path(__file__).parent / 'dl.sql')
-
 from s import main_async_func, ocd
 
+
+CfgMgr.set_paths(Path(__file__).parent / 'download_dir',
+                 Path(__file__).parent / 'dl.sql')
 
 __all__ = []
 __version__ = 0.1
 __date__ = '2022-02-28'
-__updated__ = '2022-02-28'
+__updated__ = '2022-03-08'
 
 DEBUG = 1
 TESTRUN = 0
