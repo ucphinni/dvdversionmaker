@@ -11,11 +11,12 @@
 
 -- name: start_load#
 
-DROP TABLE IF EXISTS "dvdfile_incoming";
+-- DROP TABLE IF EXISTS "dvdfile_incoming";
 CREATE TEMP TABLE "dvdfile_incoming" as
 select * from dvdfile limit 0;
 
 -- name: finish_load#
+
 insert into makeisoavail(dvdnum)
 select distinct dvdnum dvdnum  from dvdfile_incoming dfi
 where not exists(select 1 from makeisoavail mia
@@ -709,6 +710,6 @@ select * from dvdmainmenu;
 -- name: delete_all_local_paths!
 delete from localpath;
 
--- name: add_local_paths!
+-- name: add_local_paths*!
 insert into localpath(key,dir)
 values(:key,:dir);

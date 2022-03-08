@@ -3,6 +3,7 @@ Created on Mar 7, 2022
 
 @author: Cote Phinnizee
 '''
+import asyncio
 from collections import defaultdict
 import logging
 import sqlite3
@@ -19,6 +20,10 @@ def setup_db_conn(conn):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA read_uncommitted=ON")
     conn.row_factory = sqlite3.Row
+
+
+def load_module():
+    pass
 
 
 class HashPos:
@@ -84,6 +89,8 @@ class HashPos:
 
 class DbHashFile(threading.Thread):
     def __init__(self, dbfn, queries):
+        super().__init__()
+
         self._cond = threading.Condition()
         self._dbfn = dbfn
         self._fns = defaultdict(lambda: {})
@@ -114,11 +121,11 @@ class DbHashFile(threading.Thread):
             self._processing = True
 
             for fn, h in self._fns.items():
-                for ftype, hashpos in h.items():
+                for fntype, hashpos in h.items():
                     hashstr, pos, done = hashpos.get_props()
                     hash_fn_ary.append({
                         'fn': fn,
-                        'ftype': ftype,
+                        'fntype': fntype,
                         'hashstr': hashstr,
                         'pos': pos,
                         'done': done,
@@ -154,18 +161,21 @@ class DbHashFile(threading.Thread):
                 self.do_replace_hash_fns(queries, db)
 
 
-class DbMgr(threading.Thread):
-    def __init__(self, dbfn):
-        self._queries = aiosql.from_path(CfgMgr.SQLFILE, "sqlite3")
+class DbMgr():
+    __slots__ = ['_queries', '_dbfn', 'dbhf']
+
+    def __init__(self, dbfn, sqlfile):
+        self._queries = aiosql.from_path(
+            sqlfile, "sqlite3")
         self._dbfn = dbfn
         self.dbhf = DbHashFile(dbfn, self._queries)
         self.dbhf.start()
-        self._fn_p1_ary = []
 
-    def put_hash_fn(
+    async def put_hash_fn(
             self, fn, fntype, hashposobj,
             wait4commit=False):
-        self.dbfn.put_hash_fn(fn, fntype, hashposobj, wait4commit=wait4commit)
+        return await self.arun_exc(
+            self.dbhf.put_hash_fn, fn, fntype, hashposobj, wait4commit)
 
     def replace_pass1(self, fn, done):
         queries = self._queries
@@ -184,11 +194,15 @@ class DbMgr(threading.Thread):
             try:
                 setup_db_conn(db)
                 queries.delete_all_local_paths(db)
-                queries.add_local_paths(db, ary)
+                for h in ary:
+                    queries.add_local_paths(db, **h)
             except Exception:
-                logging.exception()
+                logging.exception("add_local_paths")
 
-    def add_menubreak_rows(self, menubreak_ary):
+    async def add_menubreak_rows(self, menubreak_ary):
+        return await self.arun_exc(self._add_menubreak_rows, menubreak_ary)
+
+    def _add_menubreak_rows(self, menubreak_ary):
         queries = self._queries
         if len(menubreak_ary) == 0:
             return
@@ -197,29 +211,37 @@ class DbMgr(threading.Thread):
                 setup_db_conn(db)
                 queries.add_menubreak_rows(db, menubreak_ary)
             except Exception:
-                logging.exception()
+                logging.exception("add_menubreak_rows")
 
-    def add_dvd_menu_row(self, **h):
+    def add_dvd_menu_row(self, h):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 queries.add_dvd_menu_row(db, **h)
             except Exception:
-                logging.exception()
+                logging.exception("add_dvd_menu_row")
 
-    def get_fn_hash(self, fn, fntype):
+    async def arun_exc(self, func, *args):
+        loop = asyncio.get_running_loop()
+        ret = await loop.run_in_executor(None, func, *args)
+        return ret
+
+    async def get_file_hash(self, fn, fntype):
+        return await self.arun_exc(self._get_file_hash, fn, fntype)
+
+    def _get_file_hash(self, fn, fntype):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
-                r = queries.load_db_hash(db, fn, fntype)
-                if r is None:
+                r = queries.get_file_hash(db, fn, fntype)
+                if r is None or len(r) == 0:
                     return None, None, None
                 r = r[0]
                 return r['hashstr'], r['pos'], r['done']
             except Exception:
-                logging.exception()
+                logging.exception("get_file_hash")
 
     def delete_all_menubreaks(self):
         queries = self._queries
@@ -228,25 +250,26 @@ class DbMgr(threading.Thread):
                 setup_db_conn(db)
                 queries.delete_all_menubreaks(db)
             except Exception:
-                logging.exception()
+                logging.exception("delete_all_menubreaks")
 
-    def create_schema(self):
+    def setupdb(self, create_schema, h, fn):
         queries = self._queries
+        fn = fn
+        hary = list(
+            map(lambda x: {'key': x, 'dir': str(h[x])},
+                h.keys()))
+
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
-                queries.create_schema(db)
-            except Exception:
-                logging.exception()
-
-    def start_load(self):
-        queries = self._queries
-        with sqlite3.connect(self._dbfn) as db:
-            try:
-                setup_db_conn(db)
+                if create_schema:
+                    queries.create_schema(db)
+                queries.delete_all_local_paths(db)
+                queries.add_local_paths(db, hary)
                 queries.start_load(db)
+
             except Exception:
-                logging.exception()
+                logging.exception("create_schema")
 
     def finish_load(self):
         queries = self._queries
@@ -255,7 +278,7 @@ class DbMgr(threading.Thread):
                 setup_db_conn(db)
                 queries.finish_load(db)
             except Exception:
-                logging.exception()
+                logging.exception("finish_load")
 
     def get_spumux_rows(self, dvdnum, dvdmenu):
         queries = self._queries
@@ -265,7 +288,7 @@ class DbMgr(threading.Thread):
                 return queries.get_spumux_rows(
                     db, dvdnum=dvdnum, dvdmenu=dvdmenu)
             except Exception:
-                logging.exception()
+                logging.exception("get_spumux_rows")
 
     def get_dvdauthor_rows(self, dvdnum):
         queries = self._queries
@@ -275,16 +298,28 @@ class DbMgr(threading.Thread):
                 return queries.get_dvdauthor_rows(
                     db, dvdnum=dvdnum)
             except Exception:
-                logging.exception()
+                logging.exception("get_dvdauthor_rows")
 
-    def get_dvd_files(self):
+    async def get_dvd_files(self):
+        return await self.arun_exc(self._get_dvd_files)
+
+    def _get_dvd_files(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 return queries.get_dvd_files(db)
             except Exception:
-                logging.exception()
+                logging.exception("get_dvd_files")
+
+    def get_filenames(self):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_filenames(db)
+            except Exception:
+                logging.exception("get_dvd_files")
 
     def get_dvdmenu_files(self):
         queries = self._queries
@@ -293,36 +328,28 @@ class DbMgr(threading.Thread):
                 setup_db_conn(db)
                 return queries.get_dvdmenu_files(db)
             except Exception:
-                logging.exception()
+                logging.exception("get_dvdmenu_files")
 
-    def get_menu_files(self):
+    async def get_menu_files(self):
+        return await self.arun_exc(self._get_menu_files)
+
+    def _get_menu_files(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 return queries.get_menu_files(db)
             except Exception:
-                logging.exception()
+                logging.exception("get_menu_files")
 
-    def get_all_dvdfilemenu_rows(self):
+    async def get_all_dvdfilemenu_rows(self):
+        return await self.arun_exc(self._get_all_dvdfilemenu_rows)
+
+    def _get_all_dvdfilemenu_rows(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 return queries.get_all_dvdfilemenu_rows(db)
             except Exception:
-                logging.exception()
-
-    def run_load(self, create_schema=False):
-        arg = {'create_schema': create_schema}
-        with self._cond:
-            while self._run_load_args is not None:
-                self._cond.wait()
-            self._run_load_args = arg
-            self._cond.notify_all()
-            while self._run_load_args is not None:
-                self._cond.wait()
-
-    def run(self):
-        with sqlite3.connect(self._dbfn) as db:
-            setup_db_conn(db)
+                logging.exception("get_all_dvdfilemenu_rows")

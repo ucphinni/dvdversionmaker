@@ -25,13 +25,13 @@ from pathlib import Path
 import sys
 
 from cfgmgr import CfgMgr
-import dbmgr
+from dbmgr import load_module
 from s import main_async_func, ocd
 
 
 CfgMgr.set_paths(Path(__file__).parent / 'download_dir',
                  Path(__file__).parent / 'dl.sql')
-
+load_module()
 
 __all__ = []
 __version__ = 0.1
