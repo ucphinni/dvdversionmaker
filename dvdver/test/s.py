@@ -545,9 +545,13 @@ class TaskLoader:
         self._loaders = []
         self._parent = None
         self._source = source
-        self.reset()
+        self._reset()
 
-    def reset(self):
+    async def reset(self, clear=False):
+        self._reset(clear)
+
+    def _reset(self, clear=False):
+        clear = clear
         self._queue = asyncio.Queue(maxsize=self.max_qsize)
         self._last_proc_chunk_start_pos = 0
         self._last_proc_chunk_end_pos = 0
@@ -952,6 +956,10 @@ class AsyncStreamTaskMgr:
         self._download = False
         self._cond = asyncio.Condition()
         self._file_exists = None
+
+    async def reset(self, clear=False):
+        for t in self._taskloaders:
+            await t.reset(clear=clear)
 
     def file_exists(self):
         if self._file_exists is not None:
