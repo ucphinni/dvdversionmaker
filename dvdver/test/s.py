@@ -204,9 +204,9 @@ class MenuBuilder:
         await dbmgr.add_menubreak_rows(ins_rows)
 
     async def compute_header_footer(self):
-        db, queries = self._db, self._queries
-        await self.compute_header_labels(db, queries)
-        await self.compute_footer_buttons(db, queries)
+        dbmgr = self.dbmgr
+        await self.compute_header_labels(dbmgr)
+        await self.compute_footer_buttons(dbmgr)
 
     def get_footer_label(self, _, buttonname):
         return buttonname
@@ -234,10 +234,9 @@ class MenuBuilder:
             fontsize -= jumpsize
         return (font, dy, msgs)
 
-    async def compute_header_labels(self, db, queries):
-        ary = await queries.get_header_title_rows(db,
-                                                  dvdnum=self._dvdnum,
-                                                  renum_menu=self._renum_menu)
+    async def compute_header_labels(self, dbmgr):
+        ary = await dbmgr.get_header_rows(
+            dvdnum=self._dvdnum, renum_menu=self._renum_menu)
         self._header_labels = a = {}
         dm = (int(self._size[0] * (1 - 2 * self._margins_percent[0])),
               int(self._size[1] *
@@ -249,12 +248,12 @@ class MenuBuilder:
                                                          msg, dm)
             a[dvdmenu] = ret
 
-    async def compute_footer_buttons(self, db, queries):
+    async def compute_footer_buttons(self, dbmgr):
         # Toolbar has 2 elements.  One for right side of footer
         # and one for left. We will get the alignment done later.
         x0, x1 = None, None
-        ary = await queries.get_toolbar_rows(db, dvdnum=self._dvdnum,
-                                             renum_menu=self._renum_menu)
+        ary = await dbmgr.get_toolbar_rows(
+            self._dvdnum, self._renum_menu)
         mx = self._margins_percent[0] * self._size[0]
         fls = self._footer_lblobj_space_hpercent * self._size[0]
         # y is the centerline.
@@ -717,10 +716,6 @@ class HashLoader(TaskLoader):
         self._cond = asyncio.Condition()
         self._ftype = ftype
 
-    async def arun_exc(self, func, *args):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func, *args)
-
     def reset(self):
         super().reset()
         self._hashstr = self._computed_hashstr = None
@@ -748,11 +743,10 @@ class HashLoader(TaskLoader):
 
             hashstr, pos, done = await self.dbmgr.get_file_hash(fn, fntype)
             hpos = HashPos(self._hashalgo, pos, loaded_hash_str=hashstr)
-            if done:
-                await self.arun_exc(
-                    HashPos.set_done, self.hpos)
             async with self._cond:
                 self.hpos = hpos
+                if done:
+                    await self.hpos.set_done()
                 self._cond.notify_all()
 
         except Exception:
@@ -779,16 +773,16 @@ class HashLoader(TaskLoader):
             if self.hpos.checking():
                 return
             size = self._source.finished_size()
-            pos = await self.arun_exc(HashPos.get_pos, self.hpos)
+            pos = await self.hpos.get_pos()
             done = size is not None and pos == self._source.finished_size()
+            if done:
+                await self.hpos.set_done()
             await dbmgr.put_hash_fn(
                 self._fn, self._ftype, self.hpos,
                 wait4commit=done)
             if done:
                 self._source.remove_TaskLoader(self)
                 self.stop()
-                await self.arun_exc(
-                    HashPos.set_done, self.hpos)
                 async with self._cond:
                     self._computed_hashstr = self._hashalgo.digest()
                     self._cond.notify_all()
@@ -1199,20 +1193,26 @@ def create_background_pic(
 
 
 def create_menu_mpg(bg_pic_fn, menu_pic_fn, menu_out_mpg,
-                    ffmpeg_exe=CfgMgr.FFMPEG, dvd_mode='ntsc-dvd'
+                    ffmpeg_exe=None, dvd_mode='ntsc-dvd'
                     ):
-    cmd = [ffmpeg_exe, '-loop', '1', '-i', bg_pic_fn,
-           '-i', menu_pic_fn, '-f', 'lavfi',
-           '-i', 'anullsrc=r=48000:cl=mono',
-           '-filter_complex', '[0][1] overlay',
-           '-c:v', 'mpeg2video',
-           '-map', '2:a',
-           '-t', '2', '-ab', '64k',
-           '-crf', '25',  '-pix_fmt', 'yuv420',
-           '-target', dvd_mode,
-           '-loglevel', 'quiet',
-           '-y', menu_out_mpg]
-    subprocess.run(cmd)
+    if ffmpeg_exe is None:
+        ffmpeg_exe = CfgMgr.FFMPEG
+    try:
+        cmd = [ffmpeg_exe, '-loop', '1', '-i', bg_pic_fn,
+               '-i', menu_pic_fn, '-f', 'lavfi',
+               '-i', 'anullsrc=r=48000:cl=mono',
+               '-filter_complex', '[0][1] overlay',
+               '-c:v', 'mpeg2video',
+               '-map', '2:a',
+               '-t', '2', '-ab', '64k',
+               '-crf', '25',  '-pix_fmt', 'yuv420',
+               '-target', dvd_mode,
+               '-loglevel', 'quiet',
+               '-y', menu_out_mpg]
+        subprocess.run(cmd)
+    except Exception:
+        logging.exception("cmd bad")
+        print(bg_pic_fn, menu_pic_fn, menu_out_mpg, ffmpeg_exe, dvd_mode)
 
 
 async def create_mensel(fn, mode):
@@ -1530,10 +1530,6 @@ class OnlineConfigDbMgr:
                 await self._cond.wait()
             self._dvdfile_load_wait_cnt -= 1
 
-    async def arun_exc(self, func, *args):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func, *args)
-
     async def run_load(self, create_schema=False):
         dbmgr = self.dbmgr
 
@@ -1552,21 +1548,18 @@ class OnlineConfigDbMgr:
         async with self._cond:
             self._dvdfile_loading = True
             self._cond.notify_all()
-        await self.arun_exc(DbMgr.setupdb, dbmgr,
-                            create_schema, h, fn)
-
-        print("read")
-        await self._read_url_config()
-        print("finish_load")
-        await self.arun_exc(DbMgr.finish_load, dbmgr)
-
+        q = asyncio.Queue(maxsize=10)
+        t = asyncio.create_task(
+            self._read_url_config(q))
+        await dbmgr.setupdb(create_schema, h, fn, q)
         async with self._cond:
             self._dvdfile_loading = False
             self._cond.notify_all()
         print("create_setup_files")
         await self.create_setup_files()
+        await t
 
-    async def _parse_streamed_lines(self, resp_lines):
+    async def _parse_streamed_lines(self, resp_lines, queue):
         async for line in resp_lines:
             split_str = line.split("\t")
             if len(split_str) == 1 and split_str[0] == '':
@@ -1614,10 +1607,10 @@ class OnlineConfigDbMgr:
             if h['start_secs'] is None:
                 h['start_secs'] = 0.0
             dbmgr = self.dbmgr
-            await self.arun_exc(
-                DbMgr.add_dvd_menu_row, dbmgr, h)
+            await queue.put(h)
+        await queue.put(None)
 
-    async def _read_url_config(self):
+    async def _read_url_config(self, queue):
 
         if self._dvd_tab_url.startswith("file://"):
             fn = self._dvd_tab_url
@@ -1625,7 +1618,7 @@ class OnlineConfigDbMgr:
             if not fn.is_absolute():
                 fn = CfgMgr.DLDIR / fn
             async with AIOFile(fn, 'r', encoding="utf-8") as f:
-                await self._parse_streamed_lines(LineReader(f))
+                await self._parse_streamed_lines(LineReader(f), queue)
             return
         session = self._session
         while True:
@@ -1633,7 +1626,7 @@ class OnlineConfigDbMgr:
                 async with session.stream('GET', self._dvd_tab_url) as resp:
                     if resp.status_code != 200:
                         return
-                    await self._parse_streamed_lines(resp.aiter_lines())
+                    await self._parse_streamed_lines(resp.aiter_lines(), queue)
             except httpx.ConnectTimeout:
                 await asyncio.sleep(5)
                 print("ConnectTimeout")
@@ -1676,7 +1669,7 @@ class OnlineConfigDbMgr:
             menusels = {}
             menubuild_rm = defaultdict(lambda: {})
             selfn = set()
-            await self.arun_exc(DbMgr.delete_all_menubreaks, dbm)
+            await dbm.delete_all_menubreaks()
 
             for row in mfary:
                 # For right now, we will only use one menu selector per disk
@@ -1705,10 +1698,9 @@ class OnlineConfigDbMgr:
                 await mb.gen_db_menubreak_rows(dvdfilemenu_ary=dvdary)
             print("gather 1")
             daary, dsary = await asyncio.gather(
-                *[
-                    self.arun_exc(DbMgr.get_dvd_files, dbm),
-                    self.arun_exc(DbMgr.get_dvdmenu_files, dbm),
-                ])
+                dbm.get_dvd_files(),
+                dbm.get_dvdmenu_files(),
+            )
             for row in mfary:
                 dvdnum = row['dvdnum']
                 renum_menu = row['renum_menu']
@@ -1743,15 +1735,13 @@ class OnlineConfigDbMgr:
                         menubuild_rm[dvdnum][renum_menu].finish_files())
             for i, _ in enumerate(qq):
                 xfn = CfgMgr.MENUDIR / qq[i][2]
-                ary = await self.arun_exc(
-                    DbMgr.get_spumux_rows, dbm, qq[i][0], qq[i][1])
+                ary = await dbm.get_spumux_rows(qq[i][0], qq[i][1])
                 fftasks.append(write_xmlrows2file(xfn, ary))
             # for dvdauthor
             for dvdnum, xfn in map(
                 lambda row: (row['dvdnum'],
                              ensure_file(CfgMgr.MENUDIR / row['xfn'])), daary):
-                ary = await self.arun_exc(
-                    DbMgr.get_dvdauthor_rows, dbm, qq[i][0])
+                ary = await dbm.get_dvdauthor_rows(qq[i][0])
                 await write_xmlrows2file(
                     xfn, ary)
             print("wait for tasks")
@@ -1821,8 +1811,7 @@ class OnlineConfigDbMgr:
     async def load_obj(self):
         await self.wait_for_dvdfile_load()
         dbmgr = self.dbmgr
-        ary = await self.arun_exc(
-            DbMgr.get_filenames, dbmgr)
+        ary = await dbmgr.get_filenames()
 
         fns = set()
         fnst = set()

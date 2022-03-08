@@ -6,13 +6,12 @@ Created on Mar 7, 2022
 import asyncio
 from collections import defaultdict
 import logging
+import queue
 import sqlite3
 import threading
 import time
 
 import aiosql
-
-from cfgmgr import CfgMgr
 
 
 def setup_db_conn(conn):
@@ -20,10 +19,6 @@ def setup_db_conn(conn):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA read_uncommitted=ON")
     conn.row_factory = sqlite3.Row
-
-
-def load_module():
-    pass
 
 
 class HashPos:
@@ -59,8 +54,13 @@ class HashPos:
                     self._hashalgoobj.digest() == self.loaded_hash_str)
             if postloadn:
                 self._hashalgoobj.update(buff[preloadn:postloadn])
+            self._pos += n
 
-    def set_done(self):
+    async def set_done(self):
+        return await self.arun_exc(
+            self._set_done)
+
+    def _set_done(self):
         with self.lock:
             self._done = True
 
@@ -68,7 +68,10 @@ class HashPos:
         with self.lock:
             return self._hashalgoobj.digest(), self._pos, self._done
 
-    def get_pos(self):
+    async def get_pos(self):
+        return await self.arun_exc(self._get_pos)
+
+    def _get_pos(self):
         with self.lock:
             return self._pos
 
@@ -79,6 +82,10 @@ class HashPos:
     def checking(self):
         with self.lock:
             return self._pos < self.load_pos
+
+    async def arun_exc(self, func, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, func, *args)
 
 
 '''
@@ -98,6 +105,7 @@ class DbHashFile(threading.Thread):
         self._processing = False
         self._queries = queries
         self.CHECKPOINT_TIMEOUT = 5  # seconds
+        self.loop = asyncio.get_running_loop()
 
     def put_hash_fn(
             self, fn, fntype, hashposobj,
@@ -162,7 +170,7 @@ class DbHashFile(threading.Thread):
 
 
 class DbMgr():
-    __slots__ = ['_queries', '_dbfn', 'dbhf']
+    __slots__ = ['_queries', '_dbfn', 'dbhf', 'loop']
 
     def __init__(self, dbfn, sqlfile):
         self._queries = aiosql.from_path(
@@ -170,6 +178,7 @@ class DbMgr():
         self._dbfn = dbfn
         self.dbhf = DbHashFile(dbfn, self._queries)
         self.dbhf.start()
+        self.loop = asyncio.get_running_loop()
 
     async def put_hash_fn(
             self, fn, fntype, hashposobj,
@@ -177,7 +186,10 @@ class DbMgr():
         return await self.arun_exc(
             self.dbhf.put_hash_fn, fn, fntype, hashposobj, wait4commit)
 
-    def replace_pass1(self, fn, done):
+    async def replace_pass1(self, fn, done):
+        return await self.arun_exc(self._replace_pass1, fn, done)
+
+    def _replace_pass1(self, fn, done):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -186,7 +198,10 @@ class DbMgr():
             except Exception:
                 logging.exception()
 
-    def add_local_paths(self, ary):
+    async def add_local_paths(self, ary):
+        return await self.arun_exc(self._add_local_paths, ary)
+
+    def _add_local_paths(self, ary):
         queries = self._queries
         if len(ary) == 0:
             return
@@ -213,7 +228,10 @@ class DbMgr():
             except Exception:
                 logging.exception("add_menubreak_rows")
 
-    def add_dvd_menu_row(self, h):
+    async def add_dvd_menu_row(self, h):
+        return await self.arun_exc(self._add_dvd_menu_row,  h)
+
+    def _add_dvd_menu_row(self, h):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -223,9 +241,7 @@ class DbMgr():
                 logging.exception("add_dvd_menu_row")
 
     async def arun_exc(self, func, *args):
-        loop = asyncio.get_running_loop()
-        ret = await loop.run_in_executor(None, func, *args)
-        return ret
+        return await self.loop.run_in_executor(None, func, *args)
 
     async def get_file_hash(self, fn, fntype):
         return await self.arun_exc(self._get_file_hash, fn, fntype)
@@ -243,7 +259,10 @@ class DbMgr():
             except Exception:
                 logging.exception("get_file_hash")
 
-    def delete_all_menubreaks(self):
+    async def delete_all_menubreaks(self):
+        return await self.arun_exc(self._delete_all_menubreaks)
+
+    def _delete_all_menubreaks(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -252,7 +271,19 @@ class DbMgr():
             except Exception:
                 logging.exception("delete_all_menubreaks")
 
-    def setupdb(self, create_schema, h, fn):
+    async def setupdb(self, create_schema, h, fn, q):
+        q2 = queue.Queue(10)
+        t = asyncio.create_task(
+            self.arun_exc(
+                self._setupdb, create_schema, h, fn, q2))
+        while True:
+            item = await q.get()
+            q2.put(item)
+            if item is None:
+                break
+        await t
+
+    def _setupdb(self, create_schema, h, fn, q):
         queries = self._queries
         fn = fn
         hary = list(
@@ -267,20 +298,31 @@ class DbMgr():
                 queries.delete_all_local_paths(db)
                 queries.add_local_paths(db, hary)
                 queries.start_load(db)
+                while True:
+                    h = q.get()
+                    if h is None:
+                        break
+                    queries.add_dvd_menu_row(db, **h)
+                queries.finish_load(db)
 
             except Exception:
                 logging.exception("create_schema")
 
-    def finish_load(self):
+    async def finish_load(self):
+        return await self.arun_exc(self._finish_load)
+
+    def _finish_load(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
-                queries.finish_load(db)
             except Exception:
                 logging.exception("finish_load")
 
-    def get_spumux_rows(self, dvdnum, dvdmenu):
+    async def get_spumux_rows(self, dvdnum, dvdmenu):
+        return await self.arun_exc(self._get_spumux_rows, dvdnum, dvdmenu)
+
+    def _get_spumux_rows(self, dvdnum, dvdmenu):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -290,7 +332,36 @@ class DbMgr():
             except Exception:
                 logging.exception("get_spumux_rows")
 
-    def get_dvdauthor_rows(self, dvdnum):
+    async def get_toolbar_rows(self, dvdnum, renum_menu):
+        return await self.arun_exc(self._get_toolbar_rows, dvdnum, renum_menu)
+
+    def _get_toolbar_rows(self, dvdnum, renum_menu):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_toolbar_rows(
+                    db, dvdnum=dvdnum, renum_menu=renum_menu)
+            except Exception:
+                logging.exception("get_toolbar_rows")
+
+    async def get_header_rows(self, dvdnum, renum_menu):
+        return await self.arun_exc(self._get_header_rows, dvdnum, renum_menu)
+
+    def _get_header_rows(self, dvdnum, renum_menu):
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                return queries.get_header_title_rows(
+                    db, dvdnum=dvdnum, renum_menu=renum_menu)
+            except Exception:
+                logging.exception("get_header_rows")
+
+    async def get_dvdauthor_rows(self, dvdnum):
+        return await self.arun_exc(self._get_dvdauthor_rows, dvdnum)
+
+    def _get_dvdauthor_rows(self, dvdnum):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -312,7 +383,10 @@ class DbMgr():
             except Exception:
                 logging.exception("get_dvd_files")
 
-    def get_filenames(self):
+    async def get_filenames(self):
+        return await self.arun_exc(self._get_filenames)
+
+    def _get_filenames(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
@@ -321,7 +395,10 @@ class DbMgr():
             except Exception:
                 logging.exception("get_dvd_files")
 
-    def get_dvdmenu_files(self):
+    async def get_dvdmenu_files(self):
+        return await self.arun_exc(self._get_dvdmenu_files)
+
+    def _get_dvdmenu_files(self):
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
