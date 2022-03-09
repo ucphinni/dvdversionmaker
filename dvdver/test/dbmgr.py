@@ -8,7 +8,6 @@ from collections import defaultdict
 import logging
 import queue
 import sqlite3
-import threading
 import time
 
 import aiosql
@@ -22,70 +21,68 @@ def setup_db_conn(conn):
 
 
 class HashPos:
-    def __init__(
-            self, hashalgoobj, end_pos=None, loaded_hash_str=None):
-        self._hashalgoobj = hashalgoobj
-        if end_pos is None:
-            end_pos = 0
-        self.load_pos = end_pos
+    def __init__(self, hashalgoobj):
+        '''
+        This class is not thread safe for speed
+        '''
+
+        self.loop = asyncio.get_running_loop()
+        self.loaded_hash_str = None
+        self.loaded_pos = None
         self.isgood = True
-        if end_pos == 0 and loaded_hash_str is None:
-            loaded_hash_str = hashalgoobj.digest()
-        else:
-            assert end_pos != 0 or loaded_hash_str == hashalgoobj.digest()
-
-        self.loaded_hash_str = loaded_hash_str
-        self._pos = 0
+        self.pos = 0
         self._done = False
-        self.lock = threading.Lock()
+        self.hashalgoobj = hashalgoobj
+        self._waiters_on_done = 0
+        self._cond = asyncio.Condition()
 
-    def update(self, buff):
+    async def update(self, buff):
         n = len(buff)
-        with self.lock:
-            if (self._pos >= self.load_pos or self._pos + n < self.load_pos):
-                self._hashalgoobj.update(buff)
-                self._pos += n
-                return
-            postloadn = self._pos + n - self.load_pos
-            preloadn = n - postloadn
-            self._hashalgoobj.update(buff[0:preloadn])
-            if self.isgood and self.loaded_hash_str is not None:
-                self.isgood = (
-                    self._hashalgoobj.digest() == self.loaded_hash_str)
-            if postloadn:
-                self._hashalgoobj.update(buff[preloadn:postloadn])
-            self._pos += n
+        if (self.pos >= self.loaded_pos
+                or self.pos + n < self.loaded_pos):
+            self._hashalgoobj.update(buff)
+            async with self._cond:
+                self.pos += n
+                if self._waiters_on_done:
+                    self._cond.notify_all()
+            return
+        postloadn = self.pos + n - self.loaded_pos
+        preloadn = n - postloadn
+        self._hashalgoobj.update(buff[0:preloadn])
+        if self.isgood and self.loaded_hash_str is not None:
+            self.isgood = (
+                self._hashalgoobj.digest() == self.loaded_hash_str)
+        if postloadn:
+            self._hashalgoobj.update(buff[preloadn:postloadn])
+        async with self._cond:
+            self.pos += n
+            if self._waiters_on_done:
+                self._cond.notify_all()
 
     async def set_done(self):
-        return await self.arun_exc(
-            self._set_done)
+        if self._waiters_on_done:
+            async with self._cond:
+                self._done = True
+                if self._waiters_on_done:
+                    self._cond.notify_all()
 
-    def _set_done(self):
-        with self.lock:
-            self._done = True
+    async def wait_for_hash(self, done=True):
 
-    def get_props(self):
-        with self.lock:
-            return self._hashalgoobj.digest(), self._pos, self._done
-
-    async def get_pos(self):
-        return await self.arun_exc(self._get_pos)
-
-    def _get_pos(self):
-        with self.lock:
-            return self._pos
-
-    def good(self):
-        with self.lock:
-            return self.isgood
+        async with self._cond:
+            self._waiters_on_done += 1
+            try:
+                while (done and not self._done or
+                       not done and not (
+                           self.loaded_pos is None or
+                           self.pos >= self.loaded_pos
+                       )
+                       ):
+                    await self._cond.wait()
+            finally:
+                self._waiters_on_done -= 1
 
     def checking(self):
-        with self.lock:
-            return self._pos < self.load_pos
-
-    async def arun_exc(self, func, *args):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func, *args)
+        return self.pos < self.loaded_pos
 
 
 '''
@@ -94,91 +91,107 @@ class HashPos:
  '''
 
 
-class DbHashFile(threading.Thread):
-    def __init__(self, dbfn, queries):
+class DbHashFile:
+    def __init__(self, dbmgr):
         super().__init__()
 
-        self._cond = threading.Condition()
-        self._dbfn = dbfn
+        self._lock = asyncio.Lock()
+        self._queue = queue.Queue()
+        self.dbmgr = dbmgr
         self._fns = defaultdict(lambda: {})
         self._wait4commit = False
         self._processing = False
-        self._queries = queries
-        self.CHECKPOINT_TIMEOUT = 5  # seconds
+        self.CHECKPOINT_TIMEOUT = 60  # seconds
         self.loop = asyncio.get_running_loop()
+        self.nextreqsubmittm = None
 
-    def put_hash_fn(
-            self, fn, fntype, hashposobj,
-            wait4commit=False):
-        with self._cond:
-            self._fns[fn][fntype] = hashposobj
-            if wait4commit:
-                while self._processing:
-                    self._cond.wait()
-                self._wait4commit = True
-                self._cond.notify_all()
-                while self._wait4commit:
-                    self._cond.wait()
+    ''' return whether true submit needed now '''
 
-    def do_replace_hash_fns(self, queries, db):
-        hash_fn_ary = []
+    def _trysubmit(self, flush):
+        now = self.clock()
+        if not flush:
+            # check to see if you need
+            # to turn on flush because of expiration.
+            if self.nextreqsubmittm is None:
+                self.nextreqsubmittm = (
+                    now + self.CHECKPOINT_TIMEOUT)
+                flush = False
+            elif self.nextreqsubmittm <= now:
+                flush = True
+        if flush:
+            self.nextreqsubmittm = (
+                now + self.CHECKPOINT_TIMEOUT)
+        else:
+            return flush
+
         new_fns = defaultdict(lambda: {})
+        self._queue.put(self._fns)
+        self._fns = new_fns
+        return flush
+
+    async def put_hash_fn(
+            self, fn, fntype, hashposobj,
+            flush=False):
+        with self._lock:
+            self._fns[fn][fntype] = hashposobj
+            submitreq = self._trysubmit(flush)
+        if submitreq:
+            await self.arun_exc(
+                self._proc_fns_queue)
+
+    def _proc_fns_queue(self):
         while True:
-            with self._cond:
-                self._processing = True
-
-                for fn, h in self._fns.items():
-                    for fntype, hashpos in h.items():
-                        hashstr, pos, done = hashpos.get_props()
-                        hash_fn_ary.append({
-                            'fn': fn,
-                            'fntype': fntype,
-                            'hashstr': hashstr,
-                            'pos': pos,
-                            'done': done,
-                        })
-                self._fns = new_fns
-            try:
-                queries.replace_hash_fns(db, hash_fn_ary)
-                db.commit()
-            except sqlite3.OperationalError:
-                continue  # pypy intermentant failures.
-
-            with self._cond:
-                self._wait4commit = False
-                self._processing = False
-                self._cond.notify_all()
-            break
-        return
+            fns = self._queue.get()
+            self.dbmgr._replace_hash_fns(fns)
 
     def clock(self):
         return time.monotonic()
 
-    def run(self):
-        queries = self._queries
-        with sqlite3.connect(self._dbfn) as db:
-            while True:
-                end_tm = self.clock() + self.CHECKPOINT_TIMEOUT
-                with self._cond:
-                    while True:
-                        if not self._fns:
-                            pass
-                        elif end_tm > self.clock() or self._wait4commit:
-                            break
-                        self._cond.wait(timeout=end_tm - self.clock())
-                self.do_replace_hash_fns(queries, db)
+    async def arun_exc(self, func, *args):
+        return await self.loop.run_in_executor(None, func, *args)
 
 
 class DbMgr():
     __slots__ = ['_queries', '_dbfn', 'dbhf', 'loop']
 
-    def __init__(self, dbfn, sqlfile):
+    def __init__(self, dbfn, sqlfile, hashalgofactory):
         self._queries = aiosql.from_path(
             sqlfile, "sqlite3")
         self._dbfn = dbfn
         self.dbhf = DbHashFile(dbfn, self._queries)
         self.dbhf.start()
         self.loop = asyncio.get_running_loop()
+        self._hashalgofactory = hashalgofactory
+
+    def _replace_hash_fns(self, fns):
+        queries = self._queries
+        hash_fn_ary = []
+        for fn, h in fns.items():
+            for fntype, hashpos in h.items():
+                hashstr, pos, done = (
+                    hashpos.hashalgoobj.digest(),
+                    hashpos.pos,
+                    hashpos._done)
+                hash_fn_ary.append({
+                    'fn': fn,
+                    'fntype': fntype,
+                    'hashstr': hashstr,
+                    'pos': pos,
+                    'done': done,
+                })
+
+        with sqlite3.connect(self._dbfn) as db:
+            setup_db_conn(db)
+            while True:
+                try:
+                    queries.replace_hash_fns(db, hash_fn_ary)
+                    db.commit()
+                except sqlite3.OperationalError:
+                    pass  # for pypy intermentant failures.
+                except Exception:
+                    logging.exception("replace_hash_fns")
+                    break
+        return
 
     async def put_hash_fn(
             self, fn, fntype, hashposobj,
@@ -248,11 +261,12 @@ class DbMgr():
     async def arun_exc(self, func, *args):
         return await self.loop.run_in_executor(None, func, *args)
 
-    async def get_file_hash(self, fn, fntype):
-        return await self.arun_exc(self._get_file_hash, fn, fntype)
+    async def get_new_hashpos(self, fn, fntype) -> HashPos:
+        return await self.arun_exc(self._get_new_hashpos, fn, fntype)
 
-    def _get_file_hash(self, fn, fntype):
+    def _get_new_hashpos(self, fn, fntype) -> HashPos:
         queries = self._queries
+        HashPos(self._hashalgofactory())
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
@@ -262,7 +276,7 @@ class DbMgr():
                 r = r[0]
                 return r['hashstr'], r['pos'], r['done']
             except Exception:
-                logging.exception("get_file_hash")
+                logging.exception("get_file_hash2")
 
     async def delete_all_menubreaks(self):
         return await self.arun_exc(self._delete_all_menubreaks)

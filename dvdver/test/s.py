@@ -183,7 +183,6 @@ class OnlineConfigDbMgr:
         self._cond = asyncio.Condition()
         self._done = False
         self._load = False
-        self._db_chg = False
         self._dbfn = dbfn
         self._db = None
         self._fdls = {}
@@ -206,7 +205,9 @@ class OnlineConfigDbMgr:
         self.passcnt = 2
         self.cross_process_files = True
         self._dvdfile_load_wait_cnt = 0
-        self.dbmgr = DbMgr(dbfn, CfgMgr.SQLFILE)
+        self.dbmgr = DbMgr(
+            dbfn, CfgMgr.SQLFILE,
+            lambda: hashlib.blake2b(digest_size=16))
 
     async def process_dvd_files(self, dvdnum):
         # run dvdauthor. Iso combine files.
@@ -229,7 +230,7 @@ class OnlineConfigDbMgr:
                     return self._taskme.get_exception()
                 return None
         g = hashlib.blake2b(digest_size=16)
-        g.update(bytes(row + str(fn), "utf-8"))
+        g._update(bytes(row + str(fn), "utf-8"))
         dfrowhash = g.hexdigest()
         dirobj = CfgMgr.TRANSCODEDIR / dfrowhash
         dirobj.mkdir(parents=True, exist_ok=True)
@@ -452,15 +453,18 @@ class OnlineConfigDbMgr:
                 self.fn2astm[fn] = a
                 new_fn = not a.file_exists()
                 a.run_task()
-                await asyncio.gather(
-                    *[
-                        asyncio.create_task(
-                            self.hash_task(fn, 'D', new_fn)),
-                        asyncio.create_task(
-                            self.pass_task(fn))
-                    ])
+                glist = [
+                    asyncio.create_task(
+                        self.hash_task(fn, 'D', new_fn)),
+                    asyncio.create_task(
+                        self.pass_task(fn))
+                ]
+                await self.fn_wait(fn, download=True)
+                glist.append(a.start_download())
+                await asyncio.gather(*glist)
+
         except Exception:
-            logging.exception()
+            logging.exception("file_task")
         finally:
             # Dont have to notify here. Save on signally.
             self.currentfns.remove(fn)

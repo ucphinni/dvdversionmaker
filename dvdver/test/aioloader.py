@@ -5,7 +5,6 @@ Created on Mar 8, 2022
 '''
 from abc import ABC
 import asyncio
-import hashlib
 import logging
 from pathlib import Path
 from aiofile import (AIOFile, Reader)
@@ -85,7 +84,7 @@ class TaskLoader:
     def set_afh(self, afh: AIOFile):
         self._afh = afh
         if self._source is not None:
-            pos = self._source._pos
+            pos = self._source.pos
             pos = pos if pos is not None else 0
             self.add_chunk(pos, bytearray(), block=False)
 
@@ -177,7 +176,7 @@ class TaskLoader:
 
             while self._is_running:
                 if self._source is not None:
-                    self._read_from_file_gap_end = self._source._pos
+                    self._read_from_file_gap_end = self._source.pos
                     if (self._source._afh is not None and
                             self._read_from_file_gap_end is not None and
                             self._queue.empty()):
@@ -234,31 +233,25 @@ class TaskLoader:
 class HashLoader(TaskLoader):
     def __init__(self, dbmgr, ftype, source, fn):
         super().__init__(source)
-        self._hashstr = None
         self.dbmgr = dbmgr
         self._fn = fn
-        self._hashalgo = hashlib.blake2b()
-        self.hpos = None
-        self._cond = asyncio.Condition()
         self._ftype = ftype
+        self.hpos: HashPos = None
 
     def reset(self):
         super().reset()
-        self._hashstr = self._computed_hashstr = None
+        self.hpos = None
 
     def bad_file(self, fn):
         fn = fn
 
     async def wait_for_hash(self):
-        async with self._cond:
-            while (self._computed_hashstr is None):
-                await self._cond.wait()
+        await self.hpos.wait_for_hash(done=False)
 
     def hash_match(self):
-        if self._hashstr is None:
+        if self.hpos is None:
             return None
-        return (self._hashstr is not None and
-                self._computed_hashstr == self._hashstr)
+        return self.hpos.isgood
 
     async def handle_source_eos(self):
         print("eos received")
@@ -266,22 +259,9 @@ class HashLoader(TaskLoader):
 
     async def load_db_hash(self, fn, fntype):
         try:
-
-            hashstr, pos, done = await self.dbmgr.get_file_hash(fn, fntype)
-            hpos = HashPos(self._hashalgo, pos, loaded_hash_str=hashstr)
-            async with self._cond:
-                self.hpos = hpos
-                if done:
-                    await self.hpos.set_done()
-                self._cond.notify_all()
-
+            self.hpos = await self.dbmgr.get_new_hashpos(fn, fntype)
         except Exception:
             logging.exception("load_db_hash")
-            raise
-
-    async def db_hash_exists(self):
-        async with self._cond:
-            return self._hashstr is not None
 
     async def _send_chunk(self, chunk):
         await self._hash_chunk(chunk)
@@ -290,10 +270,10 @@ class HashLoader(TaskLoader):
         try:
 
             dbmgr = self.dbmgr
-            if not self.hpos.good():
+            if not self.hpos.isgood:
                 return
-            self.hpos.update(chunk)
-            if not self.hpos.good():
+            await self.hpos.update(chunk)
+            if not self.hpos.isgood:
                 self.bad_file(self._fn)
                 return
             if self.hpos.checking():
@@ -301,7 +281,7 @@ class HashLoader(TaskLoader):
             done = False
             size = self._source.finished_size()
             if size is not None:
-                pos = await self.hpos.get_pos()
+                pos = self.hpos.pos
                 done = pos == size
                 assert pos <= size
             if done:
@@ -312,9 +292,7 @@ class HashLoader(TaskLoader):
             if done:
                 self._source.remove_TaskLoader(self)
                 self.stop()
-                async with self._cond:
-                    self._computed_hashstr = self._hashalgo.digest()
-                    self._cond.notify_all()
+
         except Exception:
             logging.exception(self._fn)
         return
@@ -461,7 +439,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
 
 class AsyncStreamTaskMgr:
     __slots__ = ('_afh', '_ahttpclient', '_taskloaders', '_url', '_fname',
-                 '_taskme', '_pos', '_taskme', '_running',
+                 '_taskme', 'pos', '_taskme', '_running',
                  '_cond', '_request_download', '_download', '_file_exists')
 
     def __init__(self, url: str = None, fname: Path = None,
@@ -471,7 +449,7 @@ class AsyncStreamTaskMgr:
         self._taskloaders = []
         self._url = url
         self._afh = None
-        self._pos = None
+        self.pos = None
         self._running = False
         self._taskme = None
         self._request_download = False
@@ -507,7 +485,7 @@ class AsyncStreamTaskMgr:
                 await self._cond.wait()
 
     async def truncate_file(self):
-        self._pos = 0
+        self.pos = 0
         for t in self._taskloaders:
             t.reset()
         await self._afh.truncate()
@@ -596,9 +574,9 @@ class AsyncStreamTaskMgr:
                 if not self._fname.exists():
                     file_sz = 0
                 else:
-                    self._pos = pos = file_sz
+                    self.pos = pos = file_sz
                 if offline:
-                    self._pos = pos = web_file_sz = file_sz
+                    self.pos = pos = web_file_sz = file_sz
 
                 resp = None
                 if web_file_sz is not None and web_file_sz == file_sz:
@@ -654,11 +632,11 @@ class AsyncStreamTaskMgr:
                                 f"{filename} for {url}")
                         if web_file_sz == file_sz:
                             pos = file_sz
-                        self._pos = pos
+                        self.pos = pos
                         request_download = None
                         async for chunk in resp.aiter_bytes():
-                            pos = await self.proc_chunk(f, self._pos, chunk)
-                            self._pos = pos
+                            pos = await self.proc_chunk(f, self.pos, chunk)
+                            self.pos = pos
                             async with self._cond:
                                 request_download = self._request_download
                             if not request_download:
@@ -695,5 +673,5 @@ class AsyncStreamTaskMgr:
 
     def finished_size(self):
         if self._taskme is None or self._url is None:
-            return self._pos
+            return self.pos
         return None
