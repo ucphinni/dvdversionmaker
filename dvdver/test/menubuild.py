@@ -11,6 +11,10 @@ from PIL import ImageFont, ImageDraw, Image
 
 
 class MenuSelector:
+    __slots__ = [
+        '_ifn', '_hfn', '_sfn', '_size'
+    ]
+
     def __init__(self, ifn, hfn, sfn, size=(10, 10)):
         self._ifn = ifn
         self._hfn = hfn
@@ -30,6 +34,43 @@ class MenuSelector:
 
 
 class MenuBuilder:
+    __slots__ = [
+        'dbmgr', '_min_dvdmenu', '_fns', '_margins_percent',
+        '_footer_lblobj_space_hpercent',
+        '_footer_sel_space_hpercent', '_label_start_hpercent',
+        '_foot_vpercent', '_head_vpercent', '_footer_font',
+        '_choice_font', '_fontname', '_pages', '_size',
+        '_renum_menu', '_dvdnum', '_sel', '_toolbars'
+    ]
+
+    def __init__(self, dbmgr, dvdnum, renum_menu,
+                 size=(720, 480), sel: MenuSelector = None,
+                 head_vpercent=.15, foot_vpercent=.10,
+                 label_start_hpercent=.10,
+                 footer_sel_space_hpercent=.02,
+                 footer_lblobj_space_hpercent=.025,
+                 margins_percent=(.01, .01),
+                 fontname='DejaVuSans'
+                 ):
+        self._toolbars = {}
+        self._sel = sel
+        self._dvdnum = dvdnum
+        self._renum_menu = renum_menu
+        self._size = size
+        self._pages = None
+        self._fontname = fontname
+        self._choice_font = ImageFont.truetype(fontname, 40)
+        self._footer_font = ImageFont.truetype(fontname, 40)
+        self._head_vpercent = head_vpercent
+        self._foot_vpercent = foot_vpercent
+        self._label_start_hpercent = label_start_hpercent
+        self._footer_sel_space_hpercent = footer_sel_space_hpercent
+        self._footer_lblobj_space_hpercent = footer_lblobj_space_hpercent
+        self._margins_percent = margins_percent
+        self._fns = {}
+        self._min_dvdmenu = None
+        self.dbmgr = dbmgr
+
     def add_dvdmenu_fn(self, dvdmenu, pfn):
         self._fns[dvdmenu] = pfn
 
@@ -242,35 +283,6 @@ class MenuBuilder:
             if Path(pfn).exists():
                 Path(pfn).unlink()
             img.save(pfn, "PNG")
-
-    def __init__(self, dbmgr, dvdnum, renum_menu,
-                 size=(720, 480), sel: MenuSelector = None,
-                 head_vpercent=.15, foot_vpercent=.10,
-                 label_start_hpercent=.10,
-                 footer_sel_space_hpercent=.02,
-                 footer_lblobj_space_hpercent=.025,
-                 margins_percent=(.01, .01),
-                 fontname='DejaVuSans'
-                 ):
-        self._toolbars = {}
-        self._sel = sel
-        self._dvdnum = dvdnum
-        self._renum_menu = renum_menu
-        self._size = size
-        self._pages = None
-        self._fontname = fontname
-        self._choice_font = ImageFont.truetype(fontname, 40)
-        self._footer_font = ImageFont.truetype(fontname, 40)
-        self._head_vpercent = head_vpercent
-        self._foot_vpercent = foot_vpercent
-        self._foot_vpercent = foot_vpercent
-        self._label_start_hpercent = label_start_hpercent
-        self._footer_sel_space_hpercent = footer_sel_space_hpercent
-        self._footer_lblobj_space_hpercent = footer_lblobj_space_hpercent
-        self._margins_percent = margins_percent
-        self._fns = {}
-        self._min_dvdmenu = None
-        self.dbmgr = dbmgr
 
     async def font_word_wrap(self, fnt, msg, width, wrap_long_text=True):
         async def msg_fits_line(fnt, msg, width):

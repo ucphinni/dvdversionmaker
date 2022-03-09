@@ -21,6 +21,12 @@ def setup_db_conn(conn):
 
 
 class HashPos:
+    __slots__ = [
+        'loop', 'loaded_hash_str', 'loaded_pos',
+        'isgood', 'pos', '_done', 'hashalgoobj',
+        '_waiters_on_done', '_cond',
+    ]
+
     def __init__(self, hashalgoobj):
         '''
         This class is not thread safe for speed
@@ -92,6 +98,12 @@ class HashPos:
 
 
 class DbHashFile:
+    __slots__ = [
+        '_lock', '_queue', 'dbmgr', '_fns', '_wait4commit',
+        '_processing', 'CHECKPOINT_TIMEOUT', 'loop',
+        'nextreqsubmittm'
+    ]
+
     def __init__(self, dbmgr):
         super().__init__()
 
@@ -152,7 +164,9 @@ class DbHashFile:
 
 
 class DbMgr():
-    __slots__ = ['_queries', '_dbfn', 'dbhf', 'loop']
+    __slots__ = [
+        '_queries', '_dbfn', 'dbhf', 'loop',
+        '_hashalgofactory']
 
     def __init__(self, dbfn, sqlfile, hashalgofactory):
         self._queries = aiosql.from_path(

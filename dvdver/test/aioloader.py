@@ -19,6 +19,18 @@ class TaskLoader:
                  '_finish_up', '_force_terminate', '_source', '_loaders',
                  '_parent',)
 
+    def __init__(self, source, max_qsize=20):
+        self.max_qsize = max_qsize
+        self._is_running = False
+        self._taskme = None
+        self._cond = asyncio.Condition()
+        self._finish_up = False
+        self._force_terminate = False
+        self._loaders = []
+        self._parent = None
+        self._source = source
+        self._reset()
+
     def add_TaskLoader(self, obj: "TaskLoader") -> None:
         self.run_task()  # noop if already running.
         obj.run_task()  # noop if already running.
@@ -55,18 +67,6 @@ class TaskLoader:
                 break
             except asyncio.QueueFull:
                 await asyncio.sleep(.5)
-
-    def __init__(self, source, max_qsize=20):
-        self.max_qsize = max_qsize
-        self._is_running = False
-        self._taskme = None
-        self._cond = asyncio.Condition()
-        self._finish_up = False
-        self._force_terminate = False
-        self._loaders = []
-        self._parent = None
-        self._source = source
-        self._reset()
 
     async def reset(self, clear=False):
         self._reset(clear)
@@ -231,6 +231,10 @@ class TaskLoader:
 
 
 class HashLoader(TaskLoader):
+    __slots__ = [
+        'dbmgr', '_fn', '_ftype', 'hpos',
+    ]
+
     def __init__(self, dbmgr, ftype, source, fn):
         super().__init__(source)
         self.dbmgr = dbmgr
@@ -299,6 +303,11 @@ class HashLoader(TaskLoader):
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
+    __slots__ = [
+        '_cmd_ary', '_task', '_proc', '_is_running_apel',
+        '_cwd', '_stderr_fname', '_stdout_fname',
+        '_cond', '_process_terminated']
+
     def __init__(self, cmd_ary, source,
                  stdout_fname, stderr_fname, cwd):
         super().__init__(source)
@@ -307,7 +316,6 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         self._proc = None
         self._is_running_apel = False
         self._process_terminated = False
-        self._process_terminating = False
         self._cond = asyncio.Condition()
         self._stdout_fname = stdout_fname
         self._stderr_fname = stderr_fname
