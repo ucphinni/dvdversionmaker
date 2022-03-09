@@ -23,7 +23,7 @@ def setup_db_conn(conn):
 class HashPos:
     __slots__ = [
         'loop', 'loaded_hash_str', 'loaded_pos',
-        'isgood', 'pos', '_done', 'hashalgoobj',
+        'isgood', 'pos', '_done', '_hashalgoobj',
         '_waiters_on_done', '_cond',
     ]
 
@@ -38,7 +38,7 @@ class HashPos:
         self.isgood = True
         self.pos = 0
         self._done = False
-        self.hashalgoobj = hashalgoobj
+        self._hashalgoobj = hashalgoobj
         self._waiters_on_done = 0
         self._cond = asyncio.Condition()
 
@@ -144,7 +144,7 @@ class DbHashFile:
     async def put_hash_fn(
             self, fn, fntype, hashposobj,
             flush=False):
-        with self._lock:
+        async with self._lock:
             self._fns[fn][fntype] = hashposobj
             submitreq = self._trysubmit(flush)
         if submitreq:
@@ -172,8 +172,7 @@ class DbMgr():
         self._queries = aiosql.from_path(
             sqlfile, "sqlite3")
         self._dbfn = dbfn
-        self.dbhf = DbHashFile(dbfn, self._queries)
-        self.dbhf.start()
+        self.dbhf = DbHashFile(self)
         self.loop = asyncio.get_running_loop()
         self._hashalgofactory = hashalgofactory
 
@@ -183,7 +182,7 @@ class DbMgr():
         for fn, h in fns.items():
             for fntype, hashpos in h.items():
                 hashstr, pos, done = (
-                    hashpos.hashalgoobj.digest(),
+                    hashpos._hashalgoobj.digest(),
                     hashpos.pos,
                     hashpos._done)
                 hash_fn_ary.append({
@@ -210,8 +209,7 @@ class DbMgr():
     async def put_hash_fn(
             self, fn, fntype, hashposobj,
             wait4commit=False):
-        return await self.arun_exc(
-            self.dbhf.put_hash_fn, fn, fntype, hashposobj, wait4commit)
+        return await self.dbhf.put_hash_fn(fn, fntype, hashposobj, wait4commit)
 
     async def replace_pass1(self, fn, done):
         return await self.arun_exc(self._replace_pass1, fn, done)
@@ -276,19 +274,26 @@ class DbMgr():
         return await self.loop.run_in_executor(None, func, *args)
 
     async def get_new_hashpos(self, fn, fntype) -> HashPos:
-        return await self.arun_exc(self._get_new_hashpos, fn, fntype)
+        hashpos = HashPos(self._hashalgofactory())
+        return await self.arun_exc(self._get_new_hashpos, fn, fntype, hashpos)
 
-    def _get_new_hashpos(self, fn, fntype) -> HashPos:
+    def _get_new_hashpos(self, fn, fntype, hashpos) -> HashPos:
         queries = self._queries
-        HashPos(self._hashalgofactory())
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 r = queries.get_file_hash(db, fn, fntype)
                 if r is None or len(r) == 0:
-                    return None, None, None
+                    hashpos.loaded_hash_str = None
+                    hashpos.loaded_pos = None
+                    hashpos._done = None
+                    return hashpos
                 r = r[0]
-                return r['hashstr'], r['pos'], r['done']
+                hashpos.loaded_hash_str = r['hashstr']
+                hashpos.loaded_pos = r['pos']
+                hashpos._done = r['done']
+                return hashpos
+
             except Exception:
                 logging.exception("get_file_hash2")
 

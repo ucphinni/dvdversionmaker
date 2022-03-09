@@ -36,7 +36,7 @@ class MenuSelector:
 class MenuBuilder:
     __slots__ = [
         'dbmgr', '_min_dvdmenu', '_fns', '_margins_percent',
-        '_footer_lblobj_space_hpercent',
+        '_footer_lblobj_space_hpercent', '_header_labels',
         '_footer_sel_space_hpercent', '_label_start_hpercent',
         '_foot_vpercent', '_head_vpercent', '_footer_font',
         '_choice_font', '_fontname', '_pages', '_size',

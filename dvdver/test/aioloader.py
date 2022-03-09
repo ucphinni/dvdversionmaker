@@ -17,7 +17,7 @@ class TaskLoader:
                  '_last_proc_chunk_end_pos', '_read_from_file_gap_end',
                  '_taskme', '_exec_obj', '_afhset', '_done_file_sz', '_cond',
                  '_finish_up', '_force_terminate', '_source', '_loaders',
-                 '_parent',)
+                 '_parent', 'max_qsize')
 
     def __init__(self, source, max_qsize=20):
         self.max_qsize = max_qsize
@@ -70,6 +70,7 @@ class TaskLoader:
 
     async def reset(self, clear=False):
         self._reset(clear)
+        return
 
     def _reset(self, clear=False):
         clear = clear
@@ -232,18 +233,18 @@ class TaskLoader:
 
 class HashLoader(TaskLoader):
     __slots__ = [
-        'dbmgr', '_fn', '_ftype', 'hpos',
+        'dbmgr', '_fn', '_fntype', 'hpos',
     ]
 
-    def __init__(self, dbmgr, ftype, source, fn):
+    def __init__(self, dbmgr, fntype, source, fn):
         super().__init__(source)
         self.dbmgr = dbmgr
         self._fn = fn
-        self._ftype = ftype
+        self._fntype = fntype
         self.hpos: HashPos = None
 
-    def reset(self):
-        super().reset()
+    async def reset(self, clear):
+        await super().reset(clear=clear)
         self.hpos = None
 
     def bad_file(self, fn):
@@ -268,6 +269,9 @@ class HashLoader(TaskLoader):
             logging.exception("load_db_hash")
 
     async def _send_chunk(self, chunk):
+        if self.hpos is None:
+            self.hpos = await self.dbmgr.get_new_hashpos(self._fn, self._fntype)
+
         await self._hash_chunk(chunk)
 
     async def _hash_chunk(self, chunk):
@@ -291,7 +295,7 @@ class HashLoader(TaskLoader):
             if done:
                 await self.hpos.set_done()
             await dbmgr.put_hash_fn(
-                self._fn, self._ftype, self.hpos,
+                self._fn, self._fntype, self.hpos,
                 wait4commit=done)
             if done:
                 self._source.remove_TaskLoader(self)
@@ -467,7 +471,8 @@ class AsyncStreamTaskMgr:
 
     async def reset(self, clear=False):
         for t in self._taskloaders:
-            await t.reset(clear=clear)
+            if t is not None:
+                await t.reset(clear=clear)
 
     def file_exists(self):
         if self._file_exists is not None:
@@ -511,6 +516,7 @@ class AsyncStreamTaskMgr:
             await asyncio.sleep(0.01)
 
     def add_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
+        assert obj
         if obj in self._taskloaders:
             return
         self.run_task()  # noop if already running

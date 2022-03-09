@@ -225,12 +225,12 @@ class OnlineConfigDbMgr:
                     stderr_fname=str(stderr_fname),
                     cwd=str(dirobj))
 
-            def get_exception(self):
+            def exception(self):
                 if self._taskme is not None:
-                    return self._taskme.get_exception()
+                    return self._taskme.exception()
                 return None
         g = hashlib.blake2b(digest_size=16)
-        g._update(bytes(row + str(fn), "utf-8"))
+        g.update(bytes(row + str(fn), "utf-8"))
         dfrowhash = g.hexdigest()
         dirobj = CfgMgr.TRANSCODEDIR / dfrowhash
         dirobj.mkdir(parents=True, exist_ok=True)
@@ -270,7 +270,7 @@ class OnlineConfigDbMgr:
             del self.dvd_tasks[dvdnum]
 
     async def fn_wait(
-            self, fn, download=False, hashfn=False,
+            self, fn, download=False, hashfn=False, hashfn_done=False,
             pass1=False, pass2=False, download_done=False,
             pass_done=False,  exc=None):
         async with self._cond:
@@ -279,6 +279,8 @@ class OnlineConfigDbMgr:
             the current is done for all dvdnums
             '''
             if hashfn:
+                pass
+            if hashfn_done:
                 pass
             if download:
                 while self.dlcnt <= 0 or (
@@ -342,8 +344,7 @@ class OnlineConfigDbMgr:
             await hl.load_db_hash(fn, ftype)
             a.add_TaskLoader(hl)
 
-            db_has_hash = await hl.db_hash_exists()
-            if (not db_has_hash and not self.cross_process_files
+            if (not self.cross_process_files
                     and not new_fn):
                 assert False
             hl.run_task()
@@ -360,7 +361,7 @@ class OnlineConfigDbMgr:
         except Exception:
             logging.exception("hash_task")
         finally:
-            await self.fn_wait(fn, hash_done=True)
+            await self.fn_wait(fn, hashfn_done=True)
 
     async def pass_task(self, fn):
         a = self.fn2astm[fn]
@@ -380,7 +381,7 @@ class OnlineConfigDbMgr:
             a.remove_TaskLoader(tcloader)
             await self.fn_wait(
                 fn, pass_done=True, pass1=True,
-                exc=tcloader.get_exception())
+                exc=tcloader.exception())
         try:
             await self.fn_wait(fn, pass2=True)
         except asyncio.exceptions.CancelledError:
@@ -402,7 +403,7 @@ class OnlineConfigDbMgr:
             a.remove_TaskLoader(tcloader)
             await self.fn_wait(
                 fn, pass_done=True, pass2=True,
-                exc=tcloader.get_exception())
+                exc=tcloader.exception())
 
     async def file_task(self, dvdnum, fn, url, ahttpclient, cmp):
         try:
