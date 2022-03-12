@@ -185,6 +185,7 @@ class OnlineConfigDbMgr:
         self._load = False
         self._dbfn = dbfn
         self._db = None
+        self.loop = asyncio.get_running_loop()
         self._fdls = {}
         self._finishq = asyncio.Queue()
         self._run_load_args = None
@@ -206,8 +207,7 @@ class OnlineConfigDbMgr:
         self.cross_process_files = True
         self._dvdfile_load_wait_cnt = 0
         self.dbmgr = DbMgr(
-            dbfn, CfgMgr.SQLFILE,
-            lambda: hashlib.blake2b(digest_size=16))
+            dbfn, CfgMgr.SQLFILE, hashlib.blake2b)
 
     async def process_dvd_files(self, dvdnum):
         # run dvdauthor. Iso combine files.
@@ -336,13 +336,12 @@ class OnlineConfigDbMgr:
         tcn = tcn
         return True
 
-    async def hash_task(self, fn, ftype, new_fn=False):
+    async def hash_task(self, fn, ftype, hpos, new_fn=False):
         await self.fn_wait(fn, hashfn=True)
         try:
             a = self.fn2astm[fn]
-            hl = HashLoader(self.dbmgr, ftype, a, fn)
-            await hl.load_db_hash(fn, ftype)
-            a.add_TaskLoader(hl)
+            hl = HashLoader(self.dbmgr, ftype, a, fn, hpos)
+            await a.add_TaskLoader(hl)
 
             if (not self.cross_process_files
                     and not new_fn):
@@ -368,7 +367,7 @@ class OnlineConfigDbMgr:
 
         await self.fn_wait(fn, pass1=True)
         tcloader = self.get_transcode_loader(fn, 1, a)
-        a.add_TaskLoader(tcloader)
+        await a.add_TaskLoader(tcloader)
         try:
             tcloader.run_task()
             await tcloader._taskme
@@ -376,9 +375,9 @@ class OnlineConfigDbMgr:
             await tcloader.reset(clear=True)
             tcloader.cancel()
         except Exception:
-            logging.exception()
+            logging.exception("pass_task1")
         finally:
-            a.remove_TaskLoader(tcloader)
+            await a.remove_TaskLoader(tcloader)
             await self.fn_wait(
                 fn, pass_done=True, pass1=True,
                 exc=tcloader.exception())
@@ -387,10 +386,10 @@ class OnlineConfigDbMgr:
         except asyncio.exceptions.CancelledError:
             tcloader.reset(clear=True)
         except Exception:
-            logging.exception()
+            logging.exception("pass_task2")
 
         tcloader = self.get_transcode_loader(fn, 2, a)
-        a.add_TaskLoader(tcloader)
+        await a.add_TaskLoader(tcloader)
         try:
             tcloader.run_task()
             await tcloader._taskme
@@ -398,9 +397,9 @@ class OnlineConfigDbMgr:
             await tcloader.reset(clear=True)
             tcloader.cancel()
         except Exception:
-            logging.exception()
+            logging.exception("pass_task3")
         finally:
-            a.remove_TaskLoader(tcloader)
+            await a.remove_TaskLoader(tcloader)
             await self.fn_wait(
                 fn, pass_done=True, pass2=True,
                 exc=tcloader.exception())
@@ -428,12 +427,16 @@ class OnlineConfigDbMgr:
 
                 self._cond.notify_all()
 
+            fname = CfgMgr.DLDIR / fn
             if fn in self.fn2astm:
                 a = self.fn2astm[fn]
             else:
-                fname = CfgMgr.DLDIR / fn
-                a = AsyncStreamTaskMgr(url=url, fname=fname,
-                                       ahttpclient=ahttpclient)
+                hpos = await self.dbmgr.get_new_hashpos(
+                    fn, 'D')
+                a = AsyncStreamTaskMgr(
+                    url=url, fname=fname,
+                    ahttpclient=ahttpclient,
+                    hpos=hpos)
 
                 class DlLoader(TaskLoader):
                     def __init__(self, me, source, fn):
@@ -445,23 +448,41 @@ class OnlineConfigDbMgr:
                         await self.me.fn_wait(
                             self.fn, download_done=True,
                             exc=exc)
-                        self._source.remove_TaskLoader(self)
+                        await self._source.remove_TaskLoader(self)
 
                 dl = DlLoader(self, a, fn)
-                a.add_TaskLoader(dl)
+                await a.add_TaskLoader(dl)
                 dl.run_task()
 
                 self.fn2astm[fn] = a
-                new_fn = not a.file_exists()
-                a.run_task()
+                new_fn = not await a.file_exists()
+                if a.localfile and new_fn:
+                    # ignore.
+                    return
+                fntype = 'D'
+                hpos = await self.dbmgr.get_new_hashpos(fn, fntype)
                 glist = [
                     asyncio.create_task(
-                        self.hash_task(fn, 'D', new_fn)),
+                        self.hash_task(fn, fntype, hpos, new_fn)),
                     asyncio.create_task(
                         self.pass_task(fn))
                 ]
                 await self.fn_wait(fn, download=True)
-                glist.append(a.start_download())
+                await a.start_download()
+                while not await a.wait_for_connect():
+                    if a.need2clearfile:
+                        try:
+                            await self.loop.run_in_executor(
+                                None,
+                                lambda fname=fname: os.truncate(fname, 0))
+                        finally:
+                            pass
+                    if a.need2clearhash:
+                        await self.dbmgr.delete_hashpos(fn, fntype)
+                    async with self._cond:
+                        a.need2clearhash = False
+                        a.need2clearfile = False
+                        self._cond.notify_all()
                 await asyncio.gather(*glist)
 
         except Exception:
@@ -828,7 +849,7 @@ async def main_async_func():
     dbexists = dbfn.exists()
 
     async with httpx.AsyncClient(
-            http2=True, follow_redirects=True) as session:
+            http2=False, follow_redirects=True) as session:
         global ocd
         ocd = OnlineConfigDbMgr('file://t.tsv', session, dbfn)
         await ocd.run(dbexists=dbexists)

@@ -5,12 +5,15 @@ Created on Mar 7, 2022
 '''
 import asyncio
 from collections import defaultdict
+import hashlib
 import logging
 import queue
 import sqlite3
+import threading
 import time
 
 import aiosql
+from retry import retry
 
 
 def setup_db_conn(conn):
@@ -21,13 +24,14 @@ def setup_db_conn(conn):
 
 
 class HashPos:
-    __slots__ = [
+    __slots__ = (
         'loop', 'loaded_hash_str', 'loaded_pos',
         'isgood', 'pos', '_done', '_hashalgoobj',
         '_waiters_on_done', '_cond',
-    ]
+    )
 
-    def __init__(self, hashalgoobj):
+    def __init__(
+            self, hashalgoobj=hashlib.blake2b(digest_size=16)):
         '''
         This class is not thread safe for speed
         '''
@@ -97,12 +101,12 @@ class HashPos:
  '''
 
 
-class DbHashFile:
-    __slots__ = [
+class DbHashFile(threading.Thread):
+    __slots__ = (
         '_lock', '_queue', 'dbmgr', '_fns', '_wait4commit',
         '_processing', 'CHECKPOINT_TIMEOUT', 'loop',
         'nextreqsubmittm'
-    ]
+    )
 
     def __init__(self, dbmgr):
         super().__init__()
@@ -134,27 +138,18 @@ class DbHashFile:
             self.nextreqsubmittm = (
                 now + self.CHECKPOINT_TIMEOUT)
         else:
-            return flush
+            return
 
         new_fns = defaultdict(lambda: {})
         self._queue.put(self._fns)
         self._fns = new_fns
-        return flush
 
     async def put_hash_fn(
             self, fn, fntype, hashposobj,
             flush=False):
         async with self._lock:
             self._fns[fn][fntype] = hashposobj
-            submitreq = self._trysubmit(flush)
-        if submitreq:
-            await self.arun_exc(
-                self._proc_fns_queue)
-
-    def _proc_fns_queue(self):
-        while True:
-            fns = self._queue.get()
-            self.dbmgr._replace_hash_fns(fns)
+            self._trysubmit(flush)
 
     def clock(self):
         return time.monotonic()
@@ -162,21 +157,32 @@ class DbHashFile:
     async def arun_exc(self, func, *args):
         return await self.loop.run_in_executor(None, func, *args)
 
+    def run(self):
+        with sqlite3.connect(self.dbmgr._dbfn) as db:
+            setup_db_conn(db)
+            while True:
+                fns = self._queue.get()
+                if fns is None:
+                    break
+                self.dbmgr._replace_hash_fns(fns, db)
+
 
 class DbMgr():
-    __slots__ = [
+    __slots__ = (
         '_queries', '_dbfn', 'dbhf', 'loop',
-        '_hashalgofactory']
+        '_hashalgofactory')
 
     def __init__(self, dbfn, sqlfile, hashalgofactory):
         self._queries = aiosql.from_path(
             sqlfile, "sqlite3")
         self._dbfn = dbfn
-        self.dbhf = DbHashFile(self)
         self.loop = asyncio.get_running_loop()
+        self.dbhf = DbHashFile(self)
+        self.dbhf.daemon = True
+        self.dbhf.start()
         self._hashalgofactory = hashalgofactory
 
-    def _replace_hash_fns(self, fns):
+    def _replace_hash_fns(self, fns, db):
         queries = self._queries
         hash_fn_ary = []
         for fn, h in fns.items():
@@ -193,17 +199,16 @@ class DbMgr():
                     'done': done,
                 })
 
-        with sqlite3.connect(self._dbfn) as db:
-            setup_db_conn(db)
-            while True:
-                try:
-                    queries.replace_hash_fns(db, hash_fn_ary)
-                    db.commit()
-                except sqlite3.OperationalError:
-                    pass  # for pypy intermentant failures.
-                except Exception:
-                    logging.exception("replace_hash_fns")
-                    break
+        while True:
+            try:
+                queries.replace_hash_fns(db, hash_fn_ary)
+                db.commit()
+                break
+            except sqlite3.OperationalError:
+                pass  # for pypy intermentant failures.
+            except Exception:
+                logging.exception("replace_hash_fns")
+                break
         return
 
     async def put_hash_fn(
@@ -222,22 +227,6 @@ class DbMgr():
                 queries.replace_p1_fns_done(db, fn=fn, done=done)
             except Exception:
                 logging.exception()
-
-    async def add_local_paths(self, ary):
-        return await self.arun_exc(self._add_local_paths, ary)
-
-    def _add_local_paths(self, ary):
-        queries = self._queries
-        if len(ary) == 0:
-            return
-        with sqlite3.connect(self._dbfn) as db:
-            try:
-                setup_db_conn(db)
-                queries.delete_all_local_paths(db)
-                for h in ary:
-                    queries.add_local_paths(db, **h)
-            except Exception:
-                logging.exception("add_local_paths")
 
     async def add_menubreak_rows(self, menubreak_ary):
         return await self.arun_exc(self._add_menubreak_rows, menubreak_ary)
@@ -285,7 +274,7 @@ class DbMgr():
                 r = queries.get_file_hash(db, fn, fntype)
                 if r is None or len(r) == 0:
                     hashpos.loaded_hash_str = None
-                    hashpos.loaded_pos = None
+                    hashpos.loaded_pos = 0
                     hashpos._done = None
                     return hashpos
                 r = r[0]
@@ -296,6 +285,18 @@ class DbMgr():
 
             except Exception:
                 logging.exception("get_file_hash2")
+
+    async def delete_hashpos(self, fn, fntype) -> None:
+        return await self.arun_exc(self._delete_hashpos, fn, fntype)
+
+    def _delete_hashpos(self, fn, fntype) -> HashPos:
+        queries = self._queries
+        with sqlite3.connect(self._dbfn) as db:
+            try:
+                setup_db_conn(db)
+                queries.delete_hash_fn(db, fn, fntype)
+            except Exception:
+                logging.exception("delete_hashpos")
 
     async def delete_all_menubreaks(self):
         return await self.arun_exc(self._delete_all_menubreaks)

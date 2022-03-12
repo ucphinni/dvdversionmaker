@@ -6,21 +6,37 @@ Created on Mar 8, 2022
 from abc import ABC
 import asyncio
 import logging
+
 from pathlib import Path
+
 from aiofile import (AIOFile, Reader)
+import aiofiles.os
 import httpx
+
 from dbmgr import HashPos
 
 
+async def get_file_size(fname):
+    size = None
+    try:
+        if fname is not None:
+            size = await aiofiles.os.path.getsize(fname)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logging.exception(f"get_file_size {fname}")
+        pass
+    return size
+
+
 class TaskLoader:
-    __slots__ = ('_queue', '_afh', '_is_running', '_last_proc_chunk_start_pos',
+    __slots__ = ('_afh', '_is_running', '_last_proc_chunk_start_pos',
                  '_last_proc_chunk_end_pos', '_read_from_file_gap_end',
                  '_taskme', '_exec_obj', '_afhset', '_done_file_sz', '_cond',
                  '_finish_up', '_force_terminate', '_source', '_loaders',
-                 '_parent', 'max_qsize')
+                 '_parent', 'localfile')
 
-    def __init__(self, source, max_qsize=20):
-        self.max_qsize = max_qsize
+    def __init__(self, source):
         self._is_running = False
         self._taskme = None
         self._cond = asyncio.Condition()
@@ -29,6 +45,7 @@ class TaskLoader:
         self._loaders = []
         self._parent = None
         self._source = source
+        self.localfile = None
         self._reset()
 
     def add_TaskLoader(self, obj: "TaskLoader") -> None:
@@ -74,23 +91,13 @@ class TaskLoader:
 
     def _reset(self, clear=False):
         clear = clear
-        self._queue = asyncio.Queue(maxsize=self.max_qsize)
         self._last_proc_chunk_start_pos = 0
         self._last_proc_chunk_end_pos = 0
         self._read_from_file_gap_end = None
         self._done_file_sz = None
-        if (self._is_running and self._afh is not None):
-            self.set_afh(self._afh)
-
-    def set_afh(self, afh: AIOFile):
-        self._afh = afh
-        if self._source is not None:
-            pos = self._source.pos
-            pos = pos if pos is not None else 0
-            self.add_chunk(pos, bytearray(), block=False)
 
     async def _send_chunk(self, _):
-        assert False  # Must Overide
+        return 0
 
     async def _proc_chunk(self, web_start_pos, chunk):
         assert web_start_pos is not None
@@ -119,9 +126,13 @@ class TaskLoader:
             # State: Can use but some possible chunk trimming work
             async with self._cond:
                 self._last_proc_chunk_start_pos = PE
-                self._last_proc_chunk_end_pos = WE
+                n = await self._send_chunk(chunk[PE - WS:])
+                if n is not None:
+                    self._last_proc_chunk_end_pos = PE + n
+                else:
+                    self._last_proc_chunk_end_pos = WE
+
                 self._cond.notify_all()
-            await self._send_chunk(chunk[PE - WS:])
             if GE is not None and GE <= WE:
                 #               WE
                 #     <---------GE   (If Gap end exists in range, clear it)
@@ -143,26 +154,9 @@ class TaskLoader:
 
     def stop(self):
         self._is_running = False
-        self._queue.put_nowait((None, None))
 
     def is_running(self):
         return self._is_running
-
-    async def _fill_gap_from_file(self):
-        pos = self._last_proc_chunk_end_pos
-        reader = Reader(self._afh, offset=pos, chunk_size=512 * 1024)
-        while self._is_running:
-            start = pos
-            chunk = await reader.read_chunk()
-            if not chunk:
-                break
-
-            pos += len(chunk)
-            await self._proc_chunk(start, chunk)
-
-            if not self._queue.empty() or self._force_terminate:
-                break
-        return
 
     async def handle_task_run_done(self):
         pass
@@ -172,45 +166,34 @@ class TaskLoader:
 
     async def run(self):
         self._is_running = True
-        assert self._source is not None
+        pos = 0
         try:
+            assert self._source is not None
 
-            while self._is_running:
-                if self._source is not None:
-                    self._read_from_file_gap_end = self._source.pos
-                    if (self._source._afh is not None and
-                            self._read_from_file_gap_end is not None and
-                            self._queue.empty()):
-                        await self._fill_gap_from_file()
-
-                if self._force_terminate:
-                    return
-
+            async with self._source._cond:
+                while self._is_running and self._source._afh is None:
+                    await self._source._cond.wait()
+            if not self._is_running:
+                return
+            reader = Reader(self._source._afh, offset=pos)
+            while True:
                 if not self._is_running:
                     break
-
-                chunk_item = await self._queue.get()
-
-                if self._force_terminate:
-                    return
-                if chunk_item[0] is None and chunk_item[1] is None:
-                    break
-                await self._proc_chunk(chunk_item[0], chunk_item[1])
-                if self._force_terminate:
-                    return
-            fin_size = self._source.finished_size()
-            assert fin_size is not None
-            self._read_from_file_gap_end = fin_size
-            if self._read_from_file_gap_end == 0:  # boundary case
-                await self._proc_chunk(0, bytearray())
-            else:
-                await self._fill_gap_from_file()
+                start = pos
+                chunk = await reader.read_chunk()
+                if not chunk:
+                    async with self._source._cond:
+                        self._source.file_waiter += 1
+                        await self._source._cond.wait()
+                        self._source.file_waiter -= 1
+                        continue
+                pos += len(chunk)
+                await self._proc_chunk(start, chunk)
 
         except asyncio.exceptions.CancelledError:
             print("Got Canceled")
             pass
         finally:
-
             self._is_running = False
 
         await self.handle_task_run_done()
@@ -219,29 +202,18 @@ class TaskLoader:
     def truncate(self):
         pass
 
-    def add_chunk(self, start_pos, chunk, block=True):
-        try:
-            if self._afh is None and block:
-                self._queue.put((start_pos, chunk))
-                return True
-            else:
-                self._queue.put_nowait((start_pos, chunk))
-                return True
-        except asyncio.QueueFull:
-            return False
-
 
 class HashLoader(TaskLoader):
-    __slots__ = [
+    __slots__ = (
         'dbmgr', '_fn', '_fntype', 'hpos',
-    ]
+    )
 
-    def __init__(self, dbmgr, fntype, source, fn):
+    def __init__(self, dbmgr, fntype, source, fn, hpos):
         super().__init__(source)
         self.dbmgr = dbmgr
         self._fn = fn
         self._fntype = fntype
-        self.hpos: HashPos = None
+        self.hpos = hpos
 
     async def reset(self, clear):
         await super().reset(clear=clear)
@@ -260,19 +232,13 @@ class HashLoader(TaskLoader):
 
     async def handle_source_eos(self):
         print("eos received")
-        self.add_chunk(None, None)
-
-    async def load_db_hash(self, fn, fntype):
-        try:
-            self.hpos = await self.dbmgr.get_new_hashpos(fn, fntype)
-        except Exception:
-            logging.exception("load_db_hash")
 
     async def _send_chunk(self, chunk):
         if self.hpos is None:
-            self.hpos = await self.dbmgr.get_new_hashpos(self._fn, self._fntype)
-
+            self.hpos = await self.dbmgr.get_new_hashpos(
+                self._fn, self._fntype)
         await self._hash_chunk(chunk)
+        return None
 
     async def _hash_chunk(self, chunk):
         try:
@@ -307,10 +273,10 @@ class HashLoader(TaskLoader):
 
 
 class AsyncProcExecLoader(TaskLoader, ABC):
-    __slots__ = [
+    __slots__ = (
         '_cmd_ary', '_task', '_proc', '_is_running_apel',
         '_cwd', '_stderr_fname', '_stdout_fname',
-        '_cond', '_process_terminated']
+        '_cond', '_process_terminated')
 
     def __init__(self, cmd_ary, source,
                  stdout_fname, stderr_fname, cwd):
@@ -418,7 +384,7 @@ class AsyncProcExecLoader(TaskLoader, ABC):
         elif len(chunk):
             pass
         else:
-            return
+            return None
         while True:
             async with self._cond:
                 if self._process_terminated:
@@ -451,37 +417,62 @@ class AsyncProcExecLoader(TaskLoader, ABC):
 
 class AsyncStreamTaskMgr:
     __slots__ = ('_afh', '_ahttpclient', '_taskloaders', '_url', '_fname',
-                 '_taskme', 'pos', '_taskme', '_running',
-                 '_cond', '_request_download', '_download', '_file_exists')
+                 '_taskme', '_pos', '_taskme', '_running',
+                 '_cond', '_request_download', '_download', '_file_exists',
+                 'hpos', 'need2clearfile', 'need2clearhash', 'connected',
+                 'file_waiter', 'localfile')
 
     def __init__(self, url: str = None, fname: Path = None,
-                 ahttpclient: httpx.AsyncClient = None):
+                 ahttpclient: httpx.AsyncClient = None, hpos=None):
         self._fname = Path(fname)
         self._ahttpclient = ahttpclient
         self._taskloaders = []
         self._url = url
         self._afh = None
-        self.pos = None
+        self._pos = None
+        self.hpos = hpos
         self._running = False
         self._taskme = None
         self._request_download = False
         self._download = False
         self._cond = asyncio.Condition()
-        self._file_exists = None
+        self.file_waiter = 0
+        self.need2clearfile = False
+        self.need2clearhash = False
+        self.connected = False
+        self.localfile = None
+
+    async def wait_for_clears(self):
+        if self.need2clearfile or self.need2clearhash:
+            pass
+        else:
+            return False
+        async with self._cond:
+            while self.need2clearfile or self.need2clearhash:
+                await self._cond.wait()
+        return True
+
+    async def wait_for_connect(self):
+        if self.connected:
+            return self.connected
+        async with self._cond:
+            while True:
+                if self.connected:
+                    break
+                if self.need2clearfile:
+                    break
+                if self.need2clearhash:
+                    break
+                await self._cond.wait()
+        return self.connected
 
     async def reset(self, clear=False):
         for t in self._taskloaders:
             if t is not None:
                 await t.reset(clear=clear)
 
-    def file_exists(self):
-        if self._file_exists is not None:
-            return self._file_exists
-        try:
-            Path(self._fname).stat().st_size
-            return True
-        finally:
-            return False
+    async def file_exists(self):
+        return (await get_file_size(self._fname)) is not None
 
     async def start_download(self):
         async with self._cond:
@@ -515,177 +506,307 @@ class AsyncStreamTaskMgr:
         while not self._running:
             await asyncio.sleep(0.01)
 
-    def add_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
+    async def add_TaskLoader(self, obj: "TaskLoader") -> None:
         assert obj
         if obj in self._taskloaders:
             return
         self.run_task()  # noop if already running
         obj.run_task()  # noop if already running
-        self._taskloaders.append(obj)
-        if self._afh is not None:
-            obj.set_afh(self._afh)
+        async with self._cond:
+            self._taskloaders.append(obj)
+            self._cond.notify_all()
+        obj._source = self
         return self
 
-    def remove_TaskLoader(self, obj: "AsyncProcExecLoader") -> None:
+    async def remove_TaskLoader(self, obj: "TaskLoader") -> None:
         if obj in self._taskloaders:
-            self._taskloaders.remove(obj)
+            async with self._cond:
+                self._taskloaders.remove(obj)
+                obj._is_running = False
+                self._cond.notify_all()
+
+            obj._source = None
         return
 
     async def proc_chunk(self, f, pos, chunk) -> int:
         if chunk is None:  # end of stream
-            for i in self._taskloaders:
-                i.add_chunk(None, None, block=False)
-            return
+            async with self._cond:
+                if self.file_waiter:
+                    self._cond.notify_all()
+            return None
         start_pos = pos
         pos += len(chunk)
         await f.write(chunk, offset=start_pos)
-        for i in self._taskloaders:
-            m = memoryview(chunk)
-            m.toreadonly()
-            i.add_chunk(start_pos, m, block=True)
+        async with self._cond:
+            waiter = self.file_waiter
+        if waiter:
+            await self._afh.fsync()
+        async with self._cond:
+            if self.file_waiter:
+                self._cond.notify_all()
         return pos
 
-    async def run(self) -> None:
-        url = self._url
-        if url and url.startswith("file://"):
-            if self._fname is None:
-                print("filename does not exist")
-                self._fname = url[7:]
-                self._url = url = None
-            elif Path(self._fname).name == url[7:]:
-                self._url = url = None
-            else:
-                print(self._url, self._fname)
-                assert False
-        offline = url is None
-        web_file_sz = None
+    async def wait_for_download_start(self):
+        async with self._cond:
+            while not self._request_download:
+                await self._cond.wait()
+            if self._download != self._request_download:
+                self._download = self._request_download
+                self._cond.notify_all()
+
+    async def stream_local_file(self, fn, hpos) -> None:
+        hpos = hpos
+        self._pos = 0
         try:
-            file_sz = Path(self._fname).stat().st_size
-            self._file_exists = True
-        except FileNotFoundError:
-            file_sz = 0
-
-        if self._fname.exists() and not self._fname.is_file():
-            raise FileNotFoundError("a non file is found")
-
-        filename = str(self._fname) if self._fname else ''
-
-        firsttime = True
-        resume_header = None
-        pos = 0
-        if filename != '':
-            f = AIOFile(self._fname, 'ab+')
-            await f.open()
-        try:
-            if filename != '':
-                self._afh = f
-
-                for i in self._taskloaders:
-                    i.set_afh(self._afh)
-            self._running = True
-            while True:
-
-                if not self._fname.exists():
-                    file_sz = 0
-                else:
-                    self.pos = pos = file_sz
-                if offline:
-                    self.pos = pos = web_file_sz = file_sz
-
-                resp = None
-                if web_file_sz is not None and web_file_sz == file_sz:
-                    break
+            size = await get_file_size(self._fname)
+            if size is None:
+                logging.warn(f"{fn}: Not found: Skipping")
+                return
+            async with AIOFile(self._fname, 'rb') as self._afh:
                 async with self._cond:
-                    while not self._request_download:
-                        await self._cond.wait()
-                    if self._download != self._request_download:
-                        self._download = self._request_download
+                    self._cond.notify_all()
+                eof = False
+                while True:
+                    await self.wait_for_download_start()
+                    eof = await self.read_stream_chunks(Reader(self._afh))
+                    if eof:
+                        break
+        except FileNotFoundError:
+            logging.exception("stream_local_file")
+
+    async def setup_connection(
+            self, fn, hpos: HashPos=None):
+        size = await get_file_size(self._fname)
+        done = False
+        if hpos is not None:
+            if (size is not None and
+                    hpos.loaded_pos is not None and
+                    size < hpos.loaded_pos and False):
+                raise ValueError(
+                    f"{fn}: size({size})<load pos({hpos.loaded_pos})")
+            self._pos = hpos.loaded_pos
+            if hpos._done:
+                done = True
+        if self._pos is None:
+            self._pos = 0
+        if done and self._pos > 0:
+            rhdr1 = {'Range': 'bytes=%d-' % (self._pos)}
+            rhdr2 = {'Range': 'bytes=%d-' % (self._pos - 1)}
+            t1 = asyncio.create_task(
+                self._ahttpclient.stream(
+                    'GET', self._url,
+                    headers=rhdr1)
+            )
+
+            t2 = asyncio.create_task(
+                self._ahttpclient.stream(
+                    'GET', self._url,
+                    headers=rhdr2)
+            )
+            r = await asyncio.gather(*[t1, t2])
+
+            if not (r[0].status_code == 416 and r[1].status_code == 206):
+                done = False
+            await r[1].aclose()
+            if done:
+                await r[0].aclose()
+                return None
+            return await r[0]
+
+        resume_header = {'Range': 'bytes=%d-' % (self._pos)}
+        # if self._pos == 0:
+        #    resume_header = None
+        strm = None
+        valid = False
+        try:
+            strm = await self._ahttpclient.get(self._url,
+                                               headers=resume_header)
+            await asyncio.sleep(0)
+            status = strm.status_code
+            if (not self.need2clearhash and
+                size is not None and hpos is not None
+                and hpos.loaded_pos is not None and
+                    size < hpos.loaded_pos):
+                raise ValueError(
+                    f'{fn}:fsize({size})<hsize({hpos.loaded_pos})')
+            if (not self.need2clearhash and
+                size is None and hpos is not None
+                    and hpos.loaded_pos is not None):
+                raise FileNotFoundError(f'{fn}:hsize({hpos.loaded_pos})')
+            valid = (status == 206 or status == 200)
+            if status == 200 and resume_header:
+                if size:
+                    valid = False
+                    raise FileExistsError(
+                        f'{fn}:Unsupported partial resume. Clearing')
+            if status == 416:
+                async with self._cond:
+                    self.need2clearhash = True
+                    self.need2clearfile = size is not None
+                    self._cond.notify_all()
+                return None
+            strm.raise_for_status()
+        except FileNotFoundError:
+            async with self._cond:
+                self.need2clearhash = True
+                self._cond.notify_all()
+        except FileExistsError:
+            async with self._cond:
+                self.need2clearfile = True
+                self._cond.notify_all()
+        except ValueError:
+            async with self._cond:
+                self.need2clearhash = hpos.loaded_pos is not None
+                self.need2clearfile = True
+                self._cond.notify_all()
+            logging.exception(f"{fn}:too short for hash.")
+        except httpx.HTTPStatusError:
+            raise
+        except FileNotFoundError:
+            async with self._cond:
+                self.need2clearhash = (
+                    hpos.loaded_pos is not None and hpos.loaded_pos > 0)
+                self._cond.notify_all()
+            logging.exception(f"{fn}:hash exists but file doesnt")
+        except httpx.ConnectTimeout:
+            await asyncio.sleep(1)
+        except httpx.ReadError:
+            await asyncio.sleep(1)
+        except httpx.ConnectError:
+            print("Connection Error: Retry " + str(self._url))
+            await asyncio.sleep(10)
+        except Exception:
+            raise
+        finally:
+            if not valid:
+                if strm is not None:
+                    await strm.aclose()
+        return strm if valid else None
+
+    async def read_stream_chunks(self, resp):
+        async for chunk in resp:
+            self._pos = await self.proc_chunk(self._afh, self._pos, chunk)
+            if not self._request_download:
+                return False
+            await asyncio.sleep(0)
+        return True
+
+    async def stream_remote_file(
+            self, fn: str, hpos: HashPos) -> None:
+        self._pos = 0
+        eof = False
+        size = await get_file_size(self._fname)
+        if hpos is not None and size and hpos.loaded_pos <= size:
+            if self._afh is None:
+                self._afh = AIOFile(self._fname, 'wb+')
+                await self._afh.open()
+                async with self._cond:
+                    self._cond.notify_all()
+
+        while True:
+            try:
+                strm = None
+                await self.wait_for_download_start()
+                try:
+                    strm = await self.setup_connection(
+                        fn, hpos=hpos)
+                except httpx.ReadTimeout:
+                    if strm is not None:
+                        await strm.aclose()
+                    await asyncio.sleep(1)
+                    continue
+                except httpx.HTTPStatusError as exc:
+                    logging.error(
+                        f"{fn}: HTTP err code:{exc.response.status_code}"
+                        f" while requesting {exc.request.url!r}.")
+                    await asyncio.sleep(10)
+                    continue
+                except Exception:
+                    logging.exception(f"{fn}")
+                    await asyncio.sleep(10)
+                    continue
+
+                hpos = None
+                if strm is None:
+                    continue
+
+                if await self.wait_for_clears():
+                    async with self._cond:
+                        self.connected = True
+                        await self._cond.notify_all()
+
+                if self._afh is None:
+                    self._afh = AIOFile(self._fname, 'wb+')
+                    await self._afh.open()
+                    async with self._cond:
                         self._cond.notify_all()
 
                 try:
-                    if not firsttime and web_file_sz is None:
-                        resume_header = {'Range': 'bytes=%d-' % (file_sz)}
-                    elif not firsttime:
-                        resume_header = {
-                            'Range': 'bytes=%d-%d' % (file_sz, web_file_sz - 1)
-                        }
-                    async with self._ahttpclient.stream('GET', url,
-                                                        headers=resume_header
-                                                        ) as resp:
-
-                        resp_code = resp.status_code
-                        if resp_code == 206:
-                            print("Got 206")
-                        if (firsttime and resp_code == 200 and
-                                resp.headers['Content-Length']):
-                            # web_file_sz = int(resp.headers['Content-Length'])
-                            firsttime = False
-                            continue
-
-                        if (resp_code == 200 or resp_code == 206 or
-                                firsttime and resp_code == 416):
-                            pass
-                        else:
-                            raise ValueError(
-                                f"Bad code {resp_code} with" +
-                                f" {filename} for {url}")
-                        if (resp_code == 200 and web_file_sz is not None
-                                and file_sz > 0 and web_file_sz != file_sz):
-                            print(f"bad size {web_file_sz} {file_sz}")
-                            pos = 0
-                            await self.truncate_file()
-                        elif (resp_code == 200 and web_file_sz is not None
-                              and file_sz == web_file_sz):
-                            break
-                        elif resp_code == 206:
-                            pos = file_sz
-                        if resp_code == 416:
-                            print('416 Range:', resume_header)
-                            raise ValueError(
-                                f"Bad code {resp_code} with " +
-                                f"{filename} for {url}")
-                        if web_file_sz == file_sz:
-                            pos = file_sz
-                        self.pos = pos
-                        request_download = None
-                        async for chunk in resp.aiter_bytes():
-                            pos = await self.proc_chunk(f, self.pos, chunk)
-                            self.pos = pos
-                            async with self._cond:
-                                request_download = self._request_download
-                            if not request_download:
-                                break
-                        if not request_download:
-                            continue
-                        break
-                except httpx.ConnectTimeout:
-                    await asyncio.sleep(1)
-                    await f.fsync()
-                    if resp is not None:
-                        await resp.aclose()
-                    continue
+                    eof = await self.read_stream_chunks(
+                        strm.aiter_bytes(chunk_size=32768))
                 except httpx.ReadTimeout:
-                    await f.fsync()
-                    if resp is not None:
-                        await resp.aclose()
-                    await asyncio.sleep(10)
+                    if self._afh is not None:
+                        await self._afh.fsync()
+                    if strm is not None:
+                        await strm.aclose()
                     continue
-                except httpx.ConnectError:
-                    print("Connection Error: Retry " + str(url))
-                    await asyncio.sleep(10)
+
+                if not eof:
                     continue
+                break
+
+            except Exception:
+                logging.exception("stream_remote_file")
+
+    async def run(self) -> None:
+        url = self._url
+        if self._running:
+            return
+
+        self._running = True
+
+        try:
+            self.localfile = False
+            if url and url.startswith("file://"):
+                if self._fname is None:
+                    print("filename does not exist")
+                    self._fname = url[7:]
+                    self._url = url = None
+                elif Path(self._fname).name == url[7:]:
+                    self._url = url = None
+                else:
+                    print(self._url, self._fname)
+                    assert False
+                self.localfile = True
+            if not url:
+                self.localfile = True
+            if self.localfile:
+                fn = Path(self._fname).name
+                logging.warn(f"START amgr {fn}")
+                await self.stream_local_file(fn, self.hpos)
+                return
+            fn = Path(self._fname).name
+            logging.warn(f"START amgr {fn}")
+            await self.stream_remote_file(fn, self.hpos)
         except asyncio.exceptions.CancelledError:
             pass
         finally:
+            for i in self._taskloaders:
+                await i.handle_source_eos()
+            async with self._cond:
+                while len(self._taskloaders):
+                    await self._cond.wait()
+            if self._afh is not None:
+                await self._afh.close()
+            try:
+                logging.warn(f"EXIT  amgr {fn}")
+            finally:
+                pass
+            self._running = False
             self._taskme = None
-        for i in self._taskloaders:
-            await i.handle_source_eos()
-
-        for i in self._taskloaders:
-            while not i._is_running:
-                await asyncio.sleep(0)
+        return
 
     def finished_size(self):
         if self._taskme is None or self._url is None:
-            return self.pos
+            return self._pos
         return None
