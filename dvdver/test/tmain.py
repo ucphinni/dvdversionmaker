@@ -79,13 +79,15 @@ class RW:
                 return self.source.done
 
             async def read(self):
-
-                if self.afh is None:
+                if self.tobereset:
                     async with self.source.cond:
                         self.resetnum = self.source.resetnum
-                        await self.wait_on_cv_for_read()
-                        self.afh = await trio.open_file(
-                            self.source.fn, 'rb', 0)
+                elif self.afh is None:
+                    async with self.source.cond:
+                        self.resetnum = self.source.resetnum
+                        done = await self.wait_on_cv_for_read()
+                    self.afh = await trio.open_file(
+                        self.source.fn, 'rb', 0)
                 while True:
                     ret = None
                     if not self.tobereset:
@@ -129,10 +131,6 @@ class RW:
                         self.source.readers.remove(self)
                     self.source.cond.notify_all()
 
-            async def reset_done(self):
-                async with self.source.cond:
-                    self.resetnum = self.source.resetnum
-
         reader = Reader(self)
 
         async with self.cond:
@@ -153,7 +151,6 @@ async def test(nm, w):
                 continue
             if r.reset_needed():
                 print(f"{nm}: reset")
-                await r.reset_done()
             else:
                 print(f"{nm}: done")
                 break
