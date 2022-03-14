@@ -8,8 +8,8 @@ import os
 import trio
 
 
-class AioFileRW:
-    def __init__(self, fn):
+class TrioFileRW:
+    def __init__(self, fn, mode='wb+'):
         self.cond = trio.Condition()
         self.readers = set()
         self.afh = None
@@ -18,6 +18,7 @@ class AioFileRW:
         self.num_waiters = 0
         self.done = False
         self.ok2read = False
+        self.mode = mode
 
     async def mark_done(self):
         await self.afh.flush()
@@ -30,7 +31,7 @@ class AioFileRW:
 
     async def write(self, buff):
         if not self.afh:
-            self.afh = await trio.open_file(self.fn, 'wb+', 0)
+            self.afh = await trio.open_file(self.fn, self.mode, 0)
             async with self.cond:
                 self.ok2read = True
                 self.cond.notify_all()
