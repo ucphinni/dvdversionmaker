@@ -6,7 +6,6 @@ Created on Mar 13, 2022
 
 import logging
 import os
-
 import trio
 
 
@@ -16,6 +15,7 @@ class RW:
         self.readers = set()
         self.size = None
         self.afh = None
+        self.fh = None
         self.fn = fn
         self.resetnum = 0
         self.num_waiters = 0
@@ -86,44 +86,47 @@ class RW:
                         await self.wait_on_cv_for_read()
                         self.afh = await trio.open_file(
                             self.source.fn, 'rb', 0)
+                while True:
+                    ret = None
+                    if not self.tobereset:
+                        try:
+                            ret = await self.afh.read(4096)
+                        except Exception:
+                            logging.exception("read")
+                    if ret is not None and len(ret):
+                        return ret
+                    oldtobereset = self.tobereset
+                    async with self.source.cond:
+                        done = await self.wait_on_cv_for_read()
+                        if self.tobereset:
+                            return None
+                    if oldtobereset and not self.tobereset:
+                        await self.afh.seek(0, os.SEEK_SET)
+                    if not self.tobereset:
+                        try:
+                            ret = await self.afh.read(4096)
+                        except Exception:
+                            logging.exception("read")
 
-                ret = None
-                if not self.tobereset:
-                    try:
-                        ret = await self.afh.read(4096)
-                    except Exception:
-                        logging.exception("read")
-                if ret is not None and len(ret):
-                    return ret
-                oldtobereset = self.tobereset
-                async with self.source.cond:
-                    done = await self.wait_on_cv_for_read()
-                    if self.tobereset:
+                    if done and (ret is None or not ret) and not self.done:
+                        await self.delete()
+                        self.done = done
+                        ret = None
+
+                    if ret is None or len(ret) == 0:
+                        ret = None
+                    if self.done:
                         return None
-                if oldtobereset and not self.tobereset:
-                    await self.afh.seek(0, os.SEEK_SET)
-                if not self.tobereset:
-                    try:
-                        ret = await self.afh.read(4096)
-                    except Exception:
-                        logging.exception("read")
-
-                if done and (ret is None or not ret) and not self.done:
-                    await self.delete()
-                    self.done = done
-                    ret = None
-
-                if ret is None or len(ret) == 0:
-                    ret = None
-                return ret
+                    if ret is not None:
+                        return ret
 
             def reset_needed(self):
                 return self.tobereset
 
             async def delete(self):
-                print("deleting self")
                 async with self.source.cond:
-                    self.source.readers.remove(self)
+                    if self in self.source.readers:
+                        self.source.readers.remove(self)
                     self.source.cond.notify_all()
 
             async def reset_done(self):
@@ -142,13 +145,20 @@ class RW:
 
 async def test(nm, w):
     r = await w.new_reader()
-    while True:
-        buff = await r.read()
-        if buff is None and r.reset_needed():
-            print(f"{nm}: reset")
-            await r.reset_done()
-        elif buff is not None:
-            print(f"{nm}: ", buff)
+    try:
+        while True:
+            buff = await r.read()
+            if buff is not None:
+                print(f"{nm}: ", buff)
+                continue
+            if r.reset_needed():
+                print(f"{nm}: reset")
+                await r.reset_done()
+            else:
+                print(f"{nm}: done")
+                break
+    finally:
+        await r.delete()
 
 
 async def trio_main():
