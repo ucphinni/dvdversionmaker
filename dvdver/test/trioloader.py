@@ -4,24 +4,21 @@ Created on Mar 8, 2022
 @author: Publishers
 '''
 from abc import ABC
-import asyncio
 import logging
-
 from pathlib import Path
 
-from aiofile import (AIOFile, Reader)
-import aiofiles.os
 import httpx
+import trio
 
-from dbmgr import HashPos
-from triocfgmgr import CfgMgr
+from triodbm import HashPos
 
 
 async def get_file_size(fname):
     size = None
     try:
         if fname is not None:
-            size = await aiofiles.os.path.getsize(fname)
+            st = await trio.Path(fname).stat()
+            size = st.st_size
     except FileNotFoundError:
         pass
     except Exception:
@@ -40,7 +37,7 @@ class TaskLoader:
     def __init__(self, source):
         self._is_running = False
         self._taskme = None
-        self._cond = asyncio.Condition()
+        self._cond = trio.Condition()
         self._finish_up = False
         self._force_terminate = False
         self._loaders = []

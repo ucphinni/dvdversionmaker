@@ -1,4 +1,3 @@
-import asyncio
 from collections import defaultdict
 from enum import IntEnum
 import hashlib
@@ -8,14 +7,12 @@ from pathlib import Path
 import subprocess
 
 from PIL import Image
-from aiofile import (AIOFile, LineReader, Writer)
 import httpx
+import trio
 
-from aioloader import (AsyncStreamTaskMgr, TaskLoader,
-                       HashLoader, AsyncProcExecLoader)
-from cfgmgr import CfgMgr
-from dbmgr import DbMgr
-from menubuild import (MenuBuilder, MenuSelector)
+from triocfgmgr import CfgMgr
+from triodbm import DbMgr
+from triomenubuild import (MenuBuilder, MenuSelector)
 
 
 def ffmpeg_cmd2pass(*fns, pass1=False, pass2=False,
@@ -180,14 +177,12 @@ class OnlineConfigDbMgr:
         self._session = session
         self._dvd_tab_url = dvd_tab_url
         self._queries = None
-        self._cond = asyncio.Condition()
+        self._cond = trio.Condition()
         self._done = False
         self._load = False
         self._dbfn = dbfn
         self._db = None
-        self.loop = asyncio.get_running_loop()
         self._fdls = {}
-        self._finishq = asyncio.Queue()
         self._run_load_args = None
         self._hash_fn_queue = []
         self._wait4commit = False
@@ -839,7 +834,6 @@ if DEBUG:
 
 
 async def main_async_func():
-    loop = asyncio.get_running_loop()
     dbfn = CfgMgr.DLDIR / 'dl.db'
 
     if dbfn.exists() and not dbfn.is_file():

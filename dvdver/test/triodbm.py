@@ -25,37 +25,67 @@ def setup_db_conn(conn):
 
 class HashPos:
     __slots__ = (
-        'loop', 'loaded_hash_str', 'loaded_pos',
+        'fn', 'fntype', 'loaded_hash_str', 'loaded_pos',
         'isgood', 'pos', '_done', '_hashalgoobj',
-        '_waiters_on_done', '_cond',
+        '_hashalgogen', '_waiters_on_done',
+        '_cond', 'deleted', 'dbmgr', 'loaded_date_str',
+        'final_size', 'etag', 'loaded_final_size',
+        'loaded_etag', 'date_str'
     )
 
     def __init__(
-            self, hashalgoobj=hashlib.blake2b(digest_size=16)):
+        self, fn, fntype='D', hashalgogen=lambda:
+            hashlib.blake2b(digest_size=16),
+            dbmgr=None, hashpos=None):
         '''
         This class is not thread safe for speed
         '''
 
         self.loaded_hash_str = None
         self.loaded_pos = None
+        self.final_size = None
+        self.loaded_final_size = None
+        self.loaded_date_str = None
+        self.etag = None
+        self.loaded_etag = None
         self.isgood = True
         self.pos = 0
         self._done = False
-        self._hashalgoobj = hashalgoobj
+        self._hashalgogen = hashalgogen
+        self._hashalgoobj = self._hashalgogen()
         self._waiters_on_done = 0
         self._cond = trio.Condition()
+        self.deleted = False
+        self.dbmgr = dbmgr
+        self.fn = fn
+        self.fntype = fntype
+        if hashpos is not None:  # Limited Ctor
+            self.dbmgr = hashpos.dbmgr
+            self.fn = hashpos.fn
+            self.fntype = hashpos.fntype
+            self._hashalgogen = hashpos._hashalgogen
+            self._hashalgoobj = self._hashalgogen()
+
+    async def sync(self):
+        if self.dbmgr is None:
+            raise ValueError("dbmgr is None")
+        await self.dbmgr.put_hash_fn(self)
+
+    def marked_deleted(self):
+        return self.deleted
 
     async def update(self, buff):
         n = len(buff)
-        if (self.pos >= self.loaded_pos
-                or self.pos + n < self.loaded_pos):
+        loaded_pos = self.loaded_pos if self.loaded_pos is not None else 0
+        if (self.pos >= loaded_pos
+                or self.pos + n < loaded_pos):
             self._hashalgoobj.update(buff)
             async with self._cond:
                 self.pos += n
                 if self._waiters_on_done:
                     self._cond.notify_all()
             return
-        postloadn = self.pos + n - self.loaded_pos
+        postloadn = self.pos + n - loaded_pos
         preloadn = n - postloadn
         self._hashalgoobj.update(buff[0:preloadn])
         if self.isgood and self.loaded_hash_str is not None:
@@ -67,6 +97,24 @@ class HashPos:
             self.pos += n
             if self._waiters_on_done:
                 self._cond.notify_all()
+
+    async def mark_deleted(self):
+        async with self._cond:
+            self.deleted = True
+            self.pos = 0
+            self.final_size = None
+            self.loaded_final_size = None
+            self.etag = None
+            self.loaded_date_str = None
+            self._hashalgoobj = self._hashalgogen()
+            self.loaded_pos = 0
+            self.loaded_hash_str = self._hashalgoobj.digest()
+            self._cond.notify_all()
+            while self._waiters_on_done:
+                self._done = True
+                await self._cond.wait()
+            self._done = False
+            self._cond.notify_all()
 
     async def set_done(self):
         if self._waiters_on_done:
@@ -143,10 +191,10 @@ class DbHashFile(threading.Thread):
         self._fns = new_fns
 
     async def put_hash_fn(
-            self, fn, fntype, hashposobj,
+            self, hashposobj,
             flush=False):
         async with self._lock:
-            self._fns[fn][fntype] = hashposobj
+            self._fns[hashposobj.fn][hashposobj.fntype] = hashposobj
             self._trysubmit(flush)
 
     def clock(self):
@@ -170,7 +218,9 @@ class DbMgr():
         '_queries', '_dbfn', 'dbhf', 'loop',
         '_hashalgofactory')
 
-    def __init__(self, dbfn, sqlfile, hashalgofactory):
+    def __init__(self, dbfn, sqlfile,
+                 hashalgofactory=lambda:
+                 hashlib.blake2b(digest_size=16)):
         self._queries = aiosql.from_path(
             sqlfile, "sqlite3")
         self._dbfn = dbfn
@@ -182,18 +232,31 @@ class DbMgr():
     def _replace_hash_fns(self, fns, db):
         queries = self._queries
         hash_fn_ary = []
+        del_hash_fn_ary = []
         for fn, h in fns.items():
             for fntype, hashpos in h.items():
-                hashstr, pos, done = (
+                if hashpos.deleted:
+                    del_hash_fn_ary.append({
+                        'fn': fn,
+                        'fntype': fntype,
+                    })
+                    continue
+                hashstr, pos, done, final_size, etag, date_str = (
                     hashpos._hashalgoobj.digest(),
                     hashpos.pos,
-                    hashpos._done)
+                    hashpos._done,
+                    hashpos.final_size,
+                    hashpos.etag,
+                    hashpos.date_str)
                 hash_fn_ary.append({
                     'fn': fn,
                     'fntype': fntype,
                     'hashstr': hashstr,
                     'pos': pos,
                     'done': done,
+                    'final_size': final_size,
+                    'etag': etag,
+                    'date_str': date_str
                 })
 
         while True:
@@ -204,14 +267,24 @@ class DbMgr():
             except sqlite3.OperationalError:
                 pass  # for pypy intermentant failures.
             except Exception:
+                logging.exception("delete_hash_fns")
+                break
+        while True:
+            try:
+                queries.delete_hash_fns(db, del_hash_fn_ary)
+                db.commit()
+                break
+            except sqlite3.OperationalError:
+                pass  # for pypy intermentant failures.
+            except Exception:
                 logging.exception("replace_hash_fns")
                 break
         return
 
     async def put_hash_fn(
-            self, fn, fntype, hashposobj,
+            self, hashposobj,
             wait4commit=False):
-        return await self.dbhf.put_hash_fn(fn, fntype, hashposobj, wait4commit)
+        return await self.dbhf.put_hash_fn(hashposobj, wait4commit)
 
     async def replace_pass1(self, fn, done):
         return await self.arun_exc(self._replace_pass1, fn, done)
@@ -259,41 +332,41 @@ class DbMgr():
     async def arun_exc(self, func, *args):
         await trio.to_thread.run_sync(func, *args)
 
-    async def get_new_hashpos(self, fn, fntype) -> HashPos:
-        hashpos = HashPos(self._hashalgofactory())
-        return await self.arun_exc(self._get_new_hashpos, fn, fntype, hashpos)
+    async def fetch_new_hashpos(self, fn, fntype) -> HashPos:
+        hashpos = HashPos(self._hashalgofactory, dbmgr=self)
+        return await self.arun_exc(
+            self._fetch_new_hashpos, fn, fntype, hashpos)
 
-    def _get_new_hashpos(self, fn, fntype, hashpos) -> HashPos:
+    def _fetch_new_hashpos(self, fn, fntype, hashpos) -> HashPos:
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:
                 setup_db_conn(db)
                 r = queries.get_file_hash(db, fn, fntype)
+                hashpos: HashPos = None
                 if r is None or len(r) == 0:
                     hashpos.loaded_hash_str = None
                     hashpos.loaded_pos = 0
                     hashpos._done = None
+                    hashpos.date_str = None
+                    hashpos.final_size = None
+                    hashpos.loaded_etag = None
+                    hashpos.etag = None
+                    hashpos.loaded_date_str = None
+                    hashpos.loaded_final_size = None
                     return hashpos
                 r = r[0]
                 hashpos.loaded_hash_str = r['hashstr']
                 hashpos.loaded_pos = r['pos']
                 hashpos._done = r['done']
+                hashpos.loaded_date_str = r['date_str']
+                hashpos.loaded_etag = r['etag']
+                hashpos.loaded_final_size = r['file_size']
+
                 return hashpos
 
             except Exception:
                 logging.exception("get_file_hash2")
-
-    async def delete_hashpos(self, fn, fntype) -> None:
-        return await self.arun_exc(self._delete_hashpos, fn, fntype)
-
-    def _delete_hashpos(self, fn, fntype) -> HashPos:
-        queries = self._queries
-        with sqlite3.connect(self._dbfn) as db:
-            try:
-                setup_db_conn(db)
-                queries.delete_hash_fn(db, fn, fntype)
-            except Exception:
-                logging.exception("delete_hashpos")
 
     async def delete_all_menubreaks(self):
         return await self.arun_exc(self._delete_all_menubreaks)
