@@ -80,7 +80,10 @@ CREATE TABLE "hash_file" (
 	"type"   CHAR NOT NULL CHECK("type" IN ("D","2")),
 	"hashstr"	TEXT NOT NULL,
 	"pos"	INTEGER NOT NULL,
-	"done"	BOOLEAN NOT NULL
+	"done"	BOOLEAN NOT NULL,
+	"date_str"	TEXT,
+	"etag"	TEXT,
+	"final_size"	INTEGER
 	DEFAULT 0 CHECK("done" = 0 OR "done" = 1),
 	PRIMARY KEY("fn","type")
 );
@@ -683,12 +686,15 @@ select distinct dvdnum,ifnull(renum_menu,0) renum_menu,min_dvdmenu from dvdmenuf
 -- name: delete_hash_fn!
 delete from hash_file where fn = :fn and type = :fntype;
 
+-- name: delete_hash_fns*!
+delete from hash_file where fn = :fn and type = :fntype;
+
 -- name: get_file_hash
 select * from hash_file where fn = :fn and type = :fntype;
 
 -- name: replace_hash_fns*!
-replace into hash_file(fn,type,hashstr,pos,done)
-VALUES(:fn,:fntype,:hashstr,:pos,:done);
+replace into hash_file(fn,type,hashstr,pos,done,date_str,final_size,etag)
+VALUES(:fn,:fntype,:hashstr,:pos,:done,:date_str,:final_size,:etag);
 
 -- name: delete_fn_pass1_done!
 delete from fn_pass1_done where fn = :fn;

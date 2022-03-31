@@ -13,7 +13,6 @@ import threading
 import time
 
 import aiosql
-from retry import retry
 
 
 def setup_db_conn(conn):
@@ -172,7 +171,9 @@ class DbMgr():
         '_queries', '_dbfn', 'dbhf', 'loop',
         '_hashalgofactory')
 
-    def __init__(self, dbfn, sqlfile, hashalgofactory):
+    def __init__(
+        self, dbfn, sqlfile, hashalgofactory=lambda:
+            hashlib.blake2b(digest_size=16)):
         self._queries = aiosql.from_path(
             sqlfile, "sqlite3")
         self._dbfn = dbfn
@@ -262,11 +263,11 @@ class DbMgr():
     async def arun_exc(self, func, *args):
         return await self.loop.run_in_executor(None, func, *args)
 
-    async def get_new_hashpos(self, fn, fntype) -> HashPos:
-        hashpos = HashPos(self._hashalgofactory())
-        return await self.arun_exc(self._get_new_hashpos, fn, fntype, hashpos)
+    async def fetch_new_hashpos(self, fn, fntype) -> HashPos:
+        hashpos = HashPos(self._hashalgofactory)
+        return await self.arun_exc(self._fetch_new_hashpos, fn, fntype, hashpos)
 
-    def _get_new_hashpos(self, fn, fntype, hashpos) -> HashPos:
+    def _fetch_new_hashpos(self, fn, fntype, hashpos) -> HashPos:
         queries = self._queries
         with sqlite3.connect(self._dbfn) as db:
             try:

@@ -5,45 +5,87 @@ Created on Mar 14, 2022
 '''
 import logging
 import os
+
 import trio
 
 
 class TrioFileRW:
-    def __init__(self, fn, mode='wb+'):
+    def __init__(self, fn: trio.Path, pos=None, mode='wb+'):
         self.cond = trio.Condition()
         self.readers = set()
         self.afh = None
-        self.fn = fn
+        self.fn: trio.Path = fn
         self.resetnum = 0
         self.num_waiters = 0
         self.done = False
         self.ok2read = False
         self.mode = mode
+        self.start_pos = pos
+        self._file_existed = None
 
-    async def mark_done(self):
+    async def file_existed(self):
+        if self._file_existed is not None:
+            return self._file_existed
+        if self.afh is not None:
+            await self.afh.seek(0, os.SEEK_END)
+            pos = await self.afh.tell()
+            self._file_existed = pos > 0
+            return self._file_existed
+
+        if not await trio.Path(self.fn).is_file():
+            self._file_existed = False
+            return self._file_existed
+
+        st = await trio.Path(self.fn).stat()
+        self._file_existed = st.st_size > 0
+        return self._file_existed
+
+    async def pos(self):
+        if self.afh is None:
+            try:
+                if not await self.fn.exists():
+                    return None
+                if not await self.fn.is_file():
+                    return None
+                st = await self.fn.stat()
+                return st.st_size
+            except Exception:
+                logging.exception(f"pos:{self.fn.name}")
+        await self.seek(0, os.SEEK_END)
+        return await self.afh.tell()
+
+    async def aclose(self):
         await self.afh.flush()
         async with self.cond:
             self.done = True
             self.cond.notify_all()
             while len(self.readers):
                 await self.cond.wait()
-        self.afh = None
+        if self.afh is not None:
+            await self.afh.aclose()
+            self.afh = None
 
     async def write(self, buff):
         if not self.afh:
             self.afh = await trio.open_file(self.fn, self.mode, 0)
+            if self.start_pos is not None:
+                await self.afh.truncate(self.start_pos)
+                await self.file_existed()
             async with self.cond:
                 self.ok2read = True
                 self.cond.notify_all()
         await self.afh.write(buff)
         async with self.cond:
-            if self.num_waiters:
-                await self.afh.flush()
+            if self.num_waiters or not self.ok2read:
                 self.ok2read = True
+            if self.num_waiters:
                 self.cond.notify_all()
 
     async def reset_file(self):
         async with self.cond:
+            self.start_pos = 0
+            if len(self.readers) == 0:
+                return
             self.resetnum += 1
             self.ok2read = False
             self.cond.notify_all()
