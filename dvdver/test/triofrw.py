@@ -41,18 +41,17 @@ class TrioFileRW:
         return self._file_existed
 
     async def pos(self):
-        if self.afh is None:
-            try:
-                if not await self.fn.exists():
-                    return None
-                if not await self.fn.is_file():
-                    return None
-                st = await self.fn.stat()
-                return st.st_size
-            except Exception:
-                logging.exception(f"pos:{self.fn.name}")
-        await self.afh.seek(0, os.SEEK_END)
-        return await self.afh.tell()
+        if self.afh is not None:
+            return await self.afh.tell()
+        try:
+            if not await self.fn.exists():
+                return None
+            if not await self.fn.is_file():
+                return None
+            st = await self.fn.stat()
+            return st.st_size
+        except Exception:
+            logging.exception(f"pos:{self.fn.name}")
 
     async def aclose(self):
         if self.afh is not None:
