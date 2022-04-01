@@ -53,6 +53,7 @@ class TrioFileRW:
         except Exception:
             logging.exception(f"pos:{self.fn.name}")
 
+
     async def aclose(self):
         if self.afh is not None:
             await self.afh.flush()
